@@ -74,10 +74,14 @@ Most users want the direct `node bench.mjs` invocation above; the wrapper is for
 
 ## The tool-call probe (bonus)
 
-`bench-toolcall.mjs` is a separate ~200-case script that checks whether a model can pick the right tool, produce valid JSON matching declared schemas, and decline when no tool fits. It uses the OpenAI-compat endpoint at `/v1/chat/completions`. It's not a regression harness — results are qualitative and it won't flag small changes.
+`bench-toolcall.mjs` is a separate script that checks whether a model can pick the right tool, produce valid JSON matching declared schemas, and decline when no tool fits. It uses the OpenAI-compat endpoint at `/v1/chat/completions`. It's not a regression harness — results are qualitative and it won't flag small changes.
 
 ```
+# host-native, if Ollama is reachable from the host
 node bench-toolcall.mjs --model gemma4:26b -v
+
+# private-network setup (mirrors the ./bench wrapper)
+OLLAMA_BENCH_CONTAINER=my-app ./bench-toolcall --model gemma4:26b -v
 ```
 
 ## License
