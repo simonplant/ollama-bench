@@ -8,39 +8,43 @@ The problem it solves: you update Ollama, swap a model digest, move the runtime 
 
 Four dimensions, each chosen because it isolates a class of regression:
 
-1. **Single-stream generation** at 4 prompt sizes (tiny / short / medium / long ≈ 20 / 200 / 2K / 8K tokens). Median over N runs. Unique pseudo-random filler per run, so every call is a KV-cache miss — otherwise prompt-eval duration collapses to zero and the numbers lie.
+1. **Single-stream generation** at 3 prompt sizes (short / medium / long ≈ 200 / 2K / 8K tokens). Median over N runs. Every call starts with a per-process nonce so the entire prompt prefix differs from any other call — defeats llama.cpp's prefix cache so prompt-eval numbers reflect real compute, not cache hits.
 2. **Cold start.** Forces eviction with `keep_alive: "0s"`, then measures `load_duration` + wall time for the next request. This is the number your user pays when the model has fallen out of VRAM.
-3. **Concurrency.** 1 / 2 / 4 / 8 parallel streams. Separates per-stream throughput from aggregate throughput — useful because Ollama serializes rather than dynamic-batches, and this lets you see it.
-4. **Environment snapshot.** Ollama version, model digest + quant, kernel, hostname. Stored in the baseline file so a regression run diffs *what changed* alongside *how it changed*.
+3. **Concurrency.** 1 / 2 / 4 / 8 parallel streams. Separates per-stream throughput from aggregate throughput. On a single GPU, scaling here is dominated by `OLLAMA_NUM_PARALLEL`.
+4. **Environment snapshot.** Ollama version, model digest + quant, GPU state (name, driver, VRAM, util, temp, power, SM clock), and the Ollama server's `OLLAMA_*` env vars. Stored in the baseline so a regression run diffs *what changed* alongside *how it changed*.
 
-## Workflow
+## Quick start
 
 ```
-./bench save       # runs the full suite, writes baseline.json
-./bench compare    # reruns and prints deltas; flags >5% regressions with ⚠
-./bench run        # runs without touching baseline
+node bench.mjs save --model gemma4:26b --host http://localhost:11434
+# …change something…
+node bench.mjs compare --model gemma4:26b --host http://localhost:11434
 ```
 
-Run `save` after any intentional upgrade (new Ollama, new model, new topology). Run `compare` before and after every other change.
+Output on `compare` flags any cell more than 5% slower than the baseline with `⚠`, and prints an `[environment changes vs baseline]` section listing any scalar that differs — Ollama version, GPU driver, `OLLAMA_NUM_PARALLEL`, etc.
 
-Full run is ~2 minutes for a 26B model on a single GPU.
+Run `save` after any intentional upgrade (new Ollama, new model, new topology). Run `compare` before and after every other change. A full run is ~2 minutes for a 26B model on a single modern GPU.
 
 ## Requirements
 
 - Node 20+ (uses built-in `fetch`). No npm install.
 - An Ollama endpoint reachable from the machine you run `bench.mjs` on.
-- `docker` on PATH if you use the `./bench` wrapper to run inside a container.
+- Optional: `nvidia-smi` on PATH for GPU state capture.
+- Optional: `docker` on PATH to read `OLLAMA_*` env vars from a containerized Ollama.
 
-## Usage directly (no wrapper)
+## Options
 
-```
-node bench.mjs save --model gemma4:26b --host http://localhost:11434 --runs 3
-node bench.mjs compare --model gemma4:26b --host http://localhost:11434
-```
+| flag | default | meaning |
+|---|---|---|
+| `--model` | `gemma4:26b` | model tag |
+| `--host` | `http://localhost:11434` | Ollama base URL |
+| `--runs` | `3` | per-cell runs, median reported |
+| `--out` | `./baseline.json` | baseline file |
+| `--regression-pct` | `5` | flag when slower by more than this % |
 
-## Usage via the wrapper
+## When Ollama is on a private Docker network
 
-If your Ollama runs on a Docker network not reachable from the host (e.g., a compose-private bridge with no host port publish), use `./bench` — it pipes the script into a sibling container that *can* reach Ollama, runs it there, and copies the baseline back to the host.
+If Ollama runs inside Docker with no host port publish (e.g., a compose bridge where only sibling containers have network access), use the `./bench` wrapper — it pipes the script into a sibling container that *can* reach Ollama, runs it there, and copies the baseline back to the host.
 
 ```
 OLLAMA_BENCH_CONTAINER=my-app ./bench save
@@ -51,27 +55,22 @@ Environment variables:
 - `OLLAMA_BENCH_CONTAINER` — the sibling container name (must have Node 20+ and network access to Ollama). Defaults try `openclaw` then `engine-openclaw-1`.
 - `OLLAMA_BENCH_REMOTE_DIR` — writable path inside the container (default `/tmp`).
 
-## Options
+Most users want the direct `node bench.mjs` invocation above; the wrapper is for private-network setups.
 
-| flag | default | meaning |
-|---|---|---|
-| `--model` | `gemma4:26b` | model tag |
-| `--host` | `http://ollama:11434` | Ollama base URL |
-| `--runs` | `3` | per-cell runs, median reported |
-| `--out` | `./baseline.json` | baseline file |
-| `--regression-pct` | `5` | flag when slower by more than this % |
+## Interpretation notes
+
+- **Per-stream tokens/sec** stays roughly constant as concurrency rises when `OLLAMA_NUM_PARALLEL=1` (Ollama's historical default) — requests are serialized on a single GPU. Aggregate t/s grows sub-linearly. Set `OLLAMA_NUM_PARALLEL` higher and you'll get batching; the concurrency scaling curve will look different. The env snapshot captures this so you know which regime you measured.
+- **Noise floor** on a warm, idle machine is typically ±3–4% for throughput and ±1.5% for wall time. Set `--regression-pct` above the noise floor for your hardware. If the tool prints a ⚠ on one cell but the rest of the run looks clean, run `compare` again before panicking.
+- **GPU must be idle.** If another process is using the GPU (image generation, game, another model), numbers are garbage. The tool warns when GPU utilization is ≥10% before a run but doesn't refuse.
+- **Baselines are machine-specific.** `baseline.json` has meaning only against the machine that produced it — GPU model, VRAM, driver, kernel, Ollama config. Don't commit baselines to a repo that multiple people use. The env-diff output lists hardware changes explicitly if you try.
+- **Absolute numbers are indicative, deltas are the product.** This is a regression tool — the headline t/s on any individual run will vary with cooling, clock boost, background noise. What matters is whether the same machine gets slower than *itself*.
 
 ## What it doesn't measure
 
 - **Capability.** Tool-call accuracy, JSON schema fidelity, instruction following, factual accuracy. See `bench-toolcall.mjs` for a small capability probe if that's what you want.
-- **Very long context.** Measured up to ~8K prompt tokens. Scale past that is model-dependent; add more `CTX_SIZES` entries if you care.
+- **Very long context.** Measured up to ~8K prompt tokens. Scale past that is model-dependent; add entries to `CTX_SIZES` if you care about 32K/64K/128K.
 - **Cross-model comparison.** It tells you whether *your* model got slower. Comparing apples to oranges is a different problem.
-
-## Interpretation notes
-
-- **Per-stream tokens/sec** stays roughly constant as concurrency rises because Ollama runs requests sequentially on a single GPU. **Aggregate tokens/sec** grows sub-linearly. This is Ollama's design, not a bug — plan for it if you need multi-user throughput on one GPU.
-- **Noise floor** on a warm, idle machine is typically ±3–4% for throughput and ±1.5% for wall time. Set `--regression-pct` above the noise floor for your hardware.
-- **First calls after `./bench save`** on a compare run tend to run slightly hot (cache effects from the save). If you want a clean compare, wait 30s or re-save immediately before comparing.
+- **OpenAI-compat vs. native API.** All measurements use `/api/generate`. If your app uses `/v1/chat/completions` with tool schemas, those have different overhead that this tool won't catch.
 
 ## The tool-call probe (bonus)
 

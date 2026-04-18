@@ -64,18 +64,32 @@ function filler(approxTokens) {
 }
 
 const CTX_SIZES = [
-  { label: "tiny",   pad: 0 },
+  // "tiny" (< 30 tokens) was noise-dominated: variance swung ±60% between
+  // identical back-to-back runs because prompt-eval duration approaches the
+  // request floor. Dropped from defaults; add back via --include-tiny if
+  // you specifically care about short-request overhead.
   { label: "short",  pad: 180 },
   { label: "medium", pad: 1800 },
   { label: "long",   pad: 7800 },
 ];
 
+// llama.cpp's prompt cache is prefix-sequential — a single different leading
+// token invalidates the cache for this prompt. Every call must therefore start
+// with a fresh token, otherwise prompt-eval t/s measures cache hits rather
+// than real throughput. Keyed by process-PID + cell + run so no two calls
+// across any invocations of this script share a prefix.
+const PROCESS_NONCE = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+
 function mkPrompt(ctxIdx, runIdx) {
-  // Seed tied to (ctxIdx, runIdx) so the same cell always sees the same prompt.
-  resetSeed(1000 + ctxIdx * 100 + runIdx);
   const size = CTX_SIZES[ctxIdx];
-  const instr = size.pad === 0 ? "Say hi in five words." : "Summarise in two sentences:";
-  return size.pad === 0 ? instr : `${instr}\n\n${filler(size.pad)}`;
+  // Seed tied to (ctxIdx, runIdx) so the filler content is reproducible for a
+  // given cell across invocations — keeps the workload size stable so t/s
+  // numbers are comparable.
+  resetSeed(1000 + ctxIdx * 100 + runIdx);
+  const body = filler(size.pad);
+  // Cache-buster first, and distinct per call, so the prompt's first token
+  // differs from any other call this process or any previous process made.
+  return `[${PROCESS_NONCE}/${ctxIdx}/${runIdx}]\nSummarise in two sentences:\n\n${body}`;
 }
 
 // ── Ollama API ───────────────────────────────────────────────────────────────
@@ -198,6 +212,37 @@ async function env() {
       modelDigest = hit?.digest ?? null;
     }
   } catch {}
+
+  // GPU state — skipped silently when nvidia-smi isn't on PATH (e.g. CPU-only
+  // or when running inside a container without the nvidia runtime mapping).
+  let gpu = null;
+  const nvOut = tryExec("nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm --format=csv,noheader,nounits");
+  if (nvOut) {
+    const lines = nvOut.split("\n").filter(Boolean);
+    gpu = lines.map(l => {
+      const [name, driver, memTotal, memUsed, util, temp, power, clock] = l.split(",").map(s => s.trim());
+      return { name, driver, memTotalMiB: +memTotal, memUsedMiB: +memUsed, utilPct: +util, tempC: +temp, powerW: +power, clockSmMHz: +clock };
+    });
+  }
+
+  // Ollama server env — OLLAMA_NUM_PARALLEL governs whether concurrent
+  // requests batch or serialize, so it's the #1 concurrency-shape variable.
+  // Read via `docker inspect` when Ollama runs as a container; otherwise
+  // fall back to the host env.
+  let ollamaServerEnv = null;
+  const dockerEnv = tryExec("docker inspect ollama --format '{{json .Config.Env}}' 2>/dev/null");
+  if (dockerEnv) {
+    try {
+      const arr = JSON.parse(dockerEnv);
+      const rel = arr.filter(kv => /^OLLAMA_/.test(kv));
+      ollamaServerEnv = Object.fromEntries(rel.map(kv => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)]; }));
+    } catch {}
+  }
+  if (!ollamaServerEnv) {
+    const relevant = ["OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_KEEP_ALIVE", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE"];
+    ollamaServerEnv = Object.fromEntries(relevant.map(k => [k, process.env[k] ?? null]).filter(([, v]) => v !== null));
+    if (Object.keys(ollamaServerEnv).length === 0) ollamaServerEnv = null;
+  }
   return {
     timestamp: new Date().toISOString(),
     model: MODEL,
@@ -211,6 +256,8 @@ async function env() {
     // May be null when running inside a minimal container image; that's fine.
     hostname: tryExec("hostname"),
     kernel: tryExec("uname -r"),
+    gpu,
+    ollamaServerEnv,
   };
 }
 
@@ -270,17 +317,58 @@ function printConcurrent(cur, base) {
 
 function envDiff(cur, base) {
   if (!base?.env) return;
-  const keys = ["ollamaVersion", "modelDigest", "modelParams", "modelQuant", "host", "kernel", "hostname"];
-  const changes = keys.filter(k => cur[k] !== base.env[k]);
+  const changes = [];
+  const scalarKeys = ["ollamaVersion", "modelDigest", "modelParams", "modelQuant", "host", "kernel", "hostname"];
+  for (const k of scalarKeys) if (cur[k] !== base.env[k]) changes.push(`${k}: ${base.env[k]} → ${cur[k]}`);
+
+  // GPU — flag hardware/driver changes; ignore transient util/temp/power/clock
+  // since those vary between any two runs on an idle machine.
+  const curGpu = cur.gpu?.[0], baseGpu = base.env.gpu?.[0];
+  if (curGpu && baseGpu) {
+    for (const k of ["name", "driver", "memTotalMiB"]) {
+      if (curGpu[k] !== baseGpu[k]) changes.push(`gpu.${k}: ${baseGpu[k]} → ${curGpu[k]}`);
+    }
+  } else if (!curGpu !== !baseGpu) {
+    changes.push(`gpu: ${baseGpu ? "present" : "absent"} → ${curGpu ? "present" : "absent"}`);
+  }
+
+  // Ollama server env — these are the config knobs most likely to explain a
+  // concurrency or latency shift.
+  const curEnv = cur.ollamaServerEnv ?? {}, baseEnv = base.env.ollamaServerEnv ?? {};
+  const envKeys = new Set([...Object.keys(curEnv), ...Object.keys(baseEnv)]);
+  for (const k of envKeys) {
+    if (curEnv[k] !== baseEnv[k]) changes.push(`${k}: ${baseEnv[k] ?? "(unset)"} → ${curEnv[k] ?? "(unset)"}`);
+  }
+
   if (changes.length === 0) return;
   console.log("\n[environment changes vs baseline]");
-  for (const k of changes) console.log(`  ${k}: ${base.env[k]} → ${cur[k]}`);
+  for (const line of changes) console.log(`  ${line}`);
+}
+
+function gpuStateSummary(env) {
+  if (!env.gpu || env.gpu.length === 0) return null;
+  const g = env.gpu[0];
+  return `${g.name} (driver ${g.driver}) — ${g.memUsedMiB}/${g.memTotalMiB} MiB, util ${g.utilPct}%, ${g.tempC}°C, ${g.powerW}W, SM ${g.clockSmMHz} MHz`;
+}
+
+function serverEnvSummary(env) {
+  const e = env.ollamaServerEnv;
+  if (!e || Object.keys(e).length === 0) return null;
+  return Object.entries(e).map(([k, v]) => `${k}=${v}`).join(" ");
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   const envSnap = await env();
   console.log(`bench: model=${envSnap.model} host=${envSnap.host} runs=${RUNS} ollama=${envSnap.ollamaVersion} digest=${(envSnap.modelDigest ?? "").slice(0, 12)}`);
+  const gpuLine = gpuStateSummary(envSnap);
+  if (gpuLine) console.log(`gpu:   ${gpuLine}`);
+  const srvLine = serverEnvSummary(envSnap);
+  if (srvLine) console.log(`ollama env: ${srvLine}`);
+  // Warn if GPU is not idle — background work will skew numbers.
+  if (envSnap.gpu?.[0] && envSnap.gpu[0].utilPct >= 10) {
+    console.log(`⚠ GPU utilization ${envSnap.gpu[0].utilPct}% before run — numbers may be noisy`);
+  }
   console.log("warming up…");
   await generate("ok?", { numPredict: 8 });
 
