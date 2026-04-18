@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Host wrapper for bench-multiturn.mjs.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$HERE/bench-multiturn.mjs"
+
+CONTAINER="${OLLAMA_BENCH_CONTAINER:-}"
+if [[ -z "$CONTAINER" ]]; then
+  for candidate in openclaw engine-openclaw-1; do
+    if docker ps --filter "name=^${candidate}$" --format '{{.Names}}' | grep -qx "$candidate"; then
+      CONTAINER="$candidate"; break
+    fi
+  done
+fi
+if [[ -z "$CONTAINER" ]]; then
+  echo "no sibling container found; set OLLAMA_BENCH_CONTAINER=<name>" >&2
+  exit 1
+fi
+
+REMOTE_DIR="${OLLAMA_BENCH_REMOTE_DIR:-/tmp}"
+REMOTE_SCRIPT="$REMOTE_DIR/ollama-bench-multiturn.mjs"
+
+docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_SCRIPT" < "$SCRIPT"
+docker exec "$CONTAINER" node "$REMOTE_SCRIPT" "$@"

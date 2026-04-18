@@ -72,16 +72,33 @@ Most users want the direct `node bench.mjs` invocation above; the wrapper is for
 - **Cross-model comparison.** It tells you whether *your* model got slower. Comparing apples to oranges is a different problem.
 - **OpenAI-compat vs. native API.** All measurements use `/api/generate`. If your app uses `/v1/chat/completions` with tool schemas, those have different overhead that this tool won't catch.
 
-## The tool-call probe (bonus)
+## Tool-calling probes (bonus)
 
-`bench-toolcall.mjs` is a separate script that checks whether a model can pick the right tool, produce valid JSON matching declared schemas, and decline when no tool fits. It uses the OpenAI-compat endpoint at `/v1/chat/completions`. It's not a regression harness — results are qualitative and it won't flag small changes.
+Two small capability probes live alongside the regression harness. Not regression harnesses themselves — they're for picking a model and characterizing its failure modes.
+
+### `bench-toolcall.mjs` — single-turn
+
+22 cases checking tool selection, schema fidelity, and correct declination when no tool fits. Passes per category; no loops in scope.
 
 ```
-# host-native, if Ollama is reachable from the host
 node bench-toolcall.mjs --model gemma4:26b -v
-
-# private-network setup (mirrors the ./bench wrapper)
 OLLAMA_BENCH_CONTAINER=my-app ./bench-toolcall --model gemma4:26b -v
+```
+
+### `bench-multiturn.mjs` — two-turn with fake tool results
+
+14 cases that test what happens **after** a tool returns. The user prompt triggers a tool call; the probe injects a fabricated tool result; the model's next turn is scored. This catches the real failure mode local models hit:
+
+- **Synthesis** — tool returned useful data; model should summarize.
+- **Empty** — tool returned `[]`; model should say "no results", NOT re-call.
+- **Error** — tool returned `{error: ...}`; model should surface or handle.
+- **Chain** — tool 1 succeeded; model should legitimately call tool 2.
+
+Scored failures are specific: `LOOP: re-called X with identical args`, `LOOP: re-called X with different args`, `unexpected tool call: Y`, `expected synthesis, got 0-char content`. When you switch models (qwen, llama, mistral), these categories show where each model breaks.
+
+```
+node bench-multiturn.mjs --model gemma4:26b -v
+OLLAMA_BENCH_CONTAINER=my-app ./bench-multiturn --model gemma4:26b -v
 ```
 
 ## License

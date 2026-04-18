@@ -148,7 +148,7 @@ function scoreCase(c, out) {
   const { calls } = out;
   const got = calls.length > 0;
   if (!c.expect.call) {
-    return { pass: !got, schema: true, reason: got ? `called ${calls[0]?.function?.name} unnecessarily` : "declined cleanly" };
+    return { pass: !got, schema: true, reason: got ? `called ${calls[0]?.function?.name} unnecessarily` : "no tool, correct" };
   }
   if (!got) return { pass: false, schema: false, reason: "expected tool call, got none" };
   const first = calls[0];
