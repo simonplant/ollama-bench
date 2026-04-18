@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Host wrapper for bench.mjs — runs the benchmark inside a Docker container
+# that has network access to Ollama. Useful when Ollama runs on a private
+# user-defined network with no host port publish, so the host can't reach
+# it directly but a sibling container can.
+#
+# Configure via environment variables:
+#   OLLAMA_BENCH_CONTAINER   name of the sibling container (must have node 20+
+#                            installed and network access to Ollama).
+#                            Default: tries "openclaw" then "engine-openclaw-1".
+#   OLLAMA_BENCH_REMOTE_DIR  writable path inside the container to stage the
+#                            script + baseline. Default: /tmp
+#
+# Usage:
+#   bench save       — run and record baseline.json
+#   bench compare    — run and show deltas vs baseline.json
+#   bench run        — run without touching baseline
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$HERE/bench.mjs"
+BASELINE_HOST="$HERE/baseline.json"
+
+# Pick container: explicit override → openclaw → engine-openclaw-1
+CONTAINER="${OLLAMA_BENCH_CONTAINER:-}"
+if [[ -z "$CONTAINER" ]]; then
+  for candidate in openclaw engine-openclaw-1; do
+    if docker ps --filter "name=^${candidate}$" --format '{{.Names}}' | grep -qx "$candidate"; then
+      CONTAINER="$candidate"; break
+    fi
+  done
+fi
+if [[ -z "$CONTAINER" ]]; then
+  echo "no sibling container found; set OLLAMA_BENCH_CONTAINER=<name>" >&2
+  exit 1
+fi
+if ! docker ps --filter "name=^${CONTAINER}$" --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  echo "container '$CONTAINER' is not running" >&2
+  exit 1
+fi
+
+REMOTE_DIR="${OLLAMA_BENCH_REMOTE_DIR:-/tmp}"
+CMD="${1:-run}"; shift || true
+REMOTE_SCRIPT="$REMOTE_DIR/ollama-bench.mjs"
+REMOTE_BASELINE="$REMOTE_DIR/ollama-bench-baseline.json"
+
+# Copy script into container
+docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_SCRIPT" < "$SCRIPT"
+
+# Seed baseline from host
+if [[ -f "$BASELINE_HOST" ]]; then
+  docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_BASELINE" < "$BASELINE_HOST"
+fi
+
+# Run
+docker exec "$CONTAINER" node "$REMOTE_SCRIPT" "$CMD" --out "$REMOTE_BASELINE" "$@"
+EXIT=$?
+
+# Persist fresh baseline back to host
+if [[ "$CMD" == "save" && $EXIT -eq 0 ]]; then
+  docker exec "$CONTAINER" cat "$REMOTE_BASELINE" > "$BASELINE_HOST"
+  echo "host baseline: $BASELINE_HOST"
+fi
+
+exit $EXIT
