@@ -27,6 +27,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const args = process.argv.slice(2);
 const cmd  = args[0] ?? "run";
@@ -66,11 +67,14 @@ function filler(approxTokens) {
 const CTX_SIZES = [
   // "tiny" (< 30 tokens) was noise-dominated: variance swung ±60% between
   // identical back-to-back runs because prompt-eval duration approaches the
-  // request floor. Dropped from defaults; add back via --include-tiny if
-  // you specifically care about short-request overhead.
-  { label: "short",  pad: 180 },
-  { label: "medium", pad: 1800 },
-  { label: "long",   pad: 7800 },
+  // request floor. Dropped from defaults.
+  { label: "short",     pad: 180,  numPredict: 128  },
+  { label: "medium",    pad: 1800, numPredict: 128  },
+  { label: "long",      pad: 7800, numPredict: 128  },
+  // Long-gen cell — same short prompt, 1024 output tokens. Catches
+  // regressions in autoregressive decode that short-gen cells miss
+  // (KV-cache growth, sampler overhead at depth).
+  { label: "long-gen",  pad: 180,  numPredict: 1024 },
 ];
 
 // llama.cpp's prompt cache is prefix-sequential — a single different leading
@@ -125,24 +129,50 @@ function median(xs) {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
+function stdev(xs) {
+  if (xs.length < 2) return 0;
+  const m = xs.reduce((a, v) => a + v, 0) / xs.length;
+  const variance = xs.reduce((a, v) => a + (v - m) ** 2, 0) / (xs.length - 1);
+  return Math.sqrt(variance);
+}
+
+// Coefficient-of-variation in percent. Used as a per-cell noise floor so the
+// regression threshold is `max(--regression-pct, 2 * cv_%)` — catches real
+// regressions on quiet cells without false-firing on noisy ones.
+function cvPct(xs) {
+  if (xs.length < 2) return 0;
+  const m = xs.reduce((a, v) => a + v, 0) / xs.length;
+  if (m === 0) return 0;
+  return 100 * stdev(xs) / m;
+}
+
 // ── Scenarios ────────────────────────────────────────────────────────────────
-async function scenarioSingleStream() {
+// On `save` runs we do extra iterations to estimate per-cell noise (cv%);
+// `compare` and `run` stick to the cheaper default.
+async function scenarioSingleStream(isSave) {
+  const runsHere = isSave ? Math.max(RUNS, 6) : RUNS;
   const results = [];
   for (let i = 0; i < CTX_SIZES.length; i++) {
+    const cell = CTX_SIZES[i];
     const pTps = [], gTps = [], total = [], load = [];
-    for (let r = 0; r < RUNS; r++) {
-      const out = await generate(mkPrompt(i, r));
+    for (let r = 0; r < runsHere; r++) {
+      const out = await generate(mkPrompt(i, r), { numPredict: cell.numPredict });
       pTps.push(out.promptTps);
       gTps.push(out.genTps);
       total.push(out.totalMs);
       load.push(out.loadMs);
     }
     results.push({
-      ctx: CTX_SIZES[i].label,
+      ctx: cell.label,
       promptTps: median(pTps),
       genTps:    median(gTps),
       totalMs:   median(total),
       loadMs:    median(load),
+      cv: isSave ? {
+        promptTps: cvPct(pTps),
+        genTps:    cvPct(gTps),
+        totalMs:   cvPct(total),
+      } : undefined,
     });
   }
   return results;
@@ -159,11 +189,12 @@ async function scenarioColdStart() {
   return { loadMs: out.loadMs, firstPromptWallMs: wall, genTps: out.genTps };
 }
 
-async function scenarioConcurrent(levels = [1, 2, 4, 8]) {
+async function scenarioConcurrent(isSave, levels = [1, 2, 4, 8]) {
   const results = [];
+  const samplesHere = isSave ? Math.max(3, Math.ceil(RUNS / 2) + 2) : Math.max(1, Math.ceil(RUNS / 2));
   for (const n of levels) {
     const samples = [];
-    for (let r = 0; r < Math.max(1, Math.ceil(RUNS / 2)); r++) {
+    for (let r = 0; r < samplesHere; r++) {
       const prompts = Array.from({ length: n }, (_, k) => mkPrompt(1, r * 100 + k)); // short prompts
       const t0 = performance.now();
       const outs = await Promise.all(prompts.map(p => generate(p, { numPredict: 64 })));
@@ -171,10 +202,13 @@ async function scenarioConcurrent(levels = [1, 2, 4, 8]) {
       const totalGen = outs.reduce((a, o) => a + o.genTokens, 0);
       samples.push({ aggGenTps: totalGen / wall, perStreamGenTps: median(outs.map(o => o.genTps)) });
     }
+    const aggs = samples.map(s => s.aggGenTps);
+    const pers = samples.map(s => s.perStreamGenTps);
     results.push({
       parallel: n,
-      aggGenTps:       median(samples.map(s => s.aggGenTps)),
-      perStreamGenTps: median(samples.map(s => s.perStreamGenTps)),
+      aggGenTps:       median(aggs),
+      perStreamGenTps: median(pers),
+      cv: isSave ? { aggGenTps: cvPct(aggs), perStreamGenTps: cvPct(pers) } : undefined,
     });
   }
   return results;
@@ -243,6 +277,22 @@ async function env() {
     ollamaServerEnv = Object.fromEntries(relevant.map(k => [k, process.env[k] ?? null]).filter(([, v]) => v !== null));
     if (Object.keys(ollamaServerEnv).length === 0) ollamaServerEnv = null;
   }
+  const hostname = tryExec("hostname");
+  const kernel   = tryExec("uname -r");
+
+  // Machine fingerprint — short hash over the fields that *define* which
+  // physical machine produced the numbers. Used to warn (not block) when a
+  // compare runs against a baseline from a different machine; different
+  // machines have different absolute t/s, and comparing them is meaningless.
+  const fingerprintSource = JSON.stringify({
+    gpuName: gpu?.[0]?.name ?? null,
+    gpuDriver: gpu?.[0]?.driver ?? null,
+    gpuMemTotalMiB: gpu?.[0]?.memTotalMiB ?? null,
+    hostname,
+    kernel,
+  });
+  const machineId = createHash("sha256").update(fingerprintSource).digest("hex").slice(0, 12);
+
   return {
     timestamp: new Date().toISOString(),
     model: MODEL,
@@ -254,8 +304,9 @@ async function env() {
     runs: RUNS,
     node: process.version,
     // May be null when running inside a minimal container image; that's fine.
-    hostname: tryExec("hostname"),
-    kernel: tryExec("uname -r"),
+    hostname,
+    kernel,
+    machineId,
     gpu,
     ollamaServerEnv,
   };
@@ -266,28 +317,37 @@ function pctDelta(cur, base) {
   if (!base || base === 0) return null;
   return ((cur - base) / base) * 100;
 }
-function fmtDelta(d, better = "higher") {
+// Per-cell threshold = max(user-set floor, 2× measured cv%). The 2σ multiplier
+// means a regression has to exceed ~95th-percentile noise for the baseline
+// cell to fire. `cvBaseline` may be undefined on old baselines — fall back
+// to the global floor.
+function thresholdFor(cvBaseline) {
+  const noiseFloor = typeof cvBaseline === "number" ? 2 * cvBaseline : 0;
+  return Math.max(REG_PCT, noiseFloor);
+}
+function fmtDelta(d, better = "higher", cvBaseline) {
   if (d === null) return "     —";
   const sign = d >= 0 ? "+" : "";
-  const isRegression = better === "higher" ? d < -REG_PCT : d > REG_PCT;
+  const thr = thresholdFor(cvBaseline);
+  const isRegression = better === "higher" ? d < -thr : d > thr;
   const marker = isRegression ? " ⚠" : "";
   return `${sign}${d.toFixed(1)}%${marker}`.padStart(8);
 }
 
 function printSingleStream(cur, base) {
   console.log("\n[single-stream generation]");
-  console.log("ctx    | prompt t/s |  gen t/s  | total ms  |  Δ prompt  |   Δ gen    |  Δ total");
-  console.log("-".repeat(90));
+  console.log("ctx       | prompt t/s |  gen t/s  | total ms  |  Δ prompt  |   Δ gen    |  Δ total");
+  console.log("-".repeat(93));
   for (const row of cur) {
     const b = base?.singleStream?.find(r => r.ctx === row.ctx);
     console.log(
-      row.ctx.padEnd(7) + "| " +
+      row.ctx.padEnd(10) + "| " +
       row.promptTps.toFixed(0).padStart(10) + " | " +
       row.genTps.toFixed(1).padStart(9) + " | " +
       row.totalMs.toFixed(0).padStart(9) + " | " +
-      (b ? fmtDelta(pctDelta(row.promptTps, b.promptTps)) : "     —  ") + " | " +
-      (b ? fmtDelta(pctDelta(row.genTps, b.genTps))       : "     —  ") + " | " +
-      (b ? fmtDelta(pctDelta(row.totalMs, b.totalMs), "lower") : "     —")
+      (b ? fmtDelta(pctDelta(row.promptTps, b.promptTps), "higher", b.cv?.promptTps) : "     —  ") + " | " +
+      (b ? fmtDelta(pctDelta(row.genTps, b.genTps), "higher", b.cv?.genTps)          : "     —  ") + " | " +
+      (b ? fmtDelta(pctDelta(row.totalMs, b.totalMs), "lower", b.cv?.totalMs)        : "     —")
     );
   }
 }
@@ -309,8 +369,8 @@ function printConcurrent(cur, base) {
       String(row.parallel).padStart(8) + " | " +
       row.aggGenTps.toFixed(1).padStart(7) + " | " +
       row.perStreamGenTps.toFixed(1).padStart(14) + " | " +
-      (b ? fmtDelta(pctDelta(row.aggGenTps, b.aggGenTps)) : "     —  ") + " | " +
-      (b ? fmtDelta(pctDelta(row.perStreamGenTps, b.perStreamGenTps)) : "     —")
+      (b ? fmtDelta(pctDelta(row.aggGenTps, b.aggGenTps), "higher", b.cv?.aggGenTps) : "     —  ") + " | " +
+      (b ? fmtDelta(pctDelta(row.perStreamGenTps, b.perStreamGenTps), "higher", b.cv?.perStreamGenTps) : "     —")
     );
   }
 }
@@ -372,12 +432,14 @@ async function main() {
   console.log("warming up…");
   await generate("ok?", { numPredict: 8 });
 
+  const isSave = cmd === "save";
+  if (isSave) console.log("(save mode — extra runs to measure per-cell noise)");
   console.log("\n[1/3] single-stream sizes…");
-  const singleStream = await scenarioSingleStream();
+  const singleStream = await scenarioSingleStream(isSave);
   console.log("[2/3] cold-start…");
   const coldStart = await scenarioColdStart();
   console.log("[3/3] concurrent streams…");
-  const concurrent = await scenarioConcurrent();
+  const concurrent = await scenarioConcurrent(isSave);
 
   const current = { env: envSnap, singleStream, coldStart, concurrent };
 
@@ -390,8 +452,18 @@ async function main() {
     ? JSON.parse(readFileSync(OUT, "utf-8")) : null;
 
   if (cmd === "compare") {
-    if (!base) { console.log(`\nno baseline at ${OUT} — run 'save' first`); }
-    else envDiff(envSnap, base);
+    if (!base) {
+      console.log(`\nno baseline at ${OUT} — run 'save' first`);
+    } else {
+      // Cross-machine compares produce noise-dominated deltas because absolute
+      // t/s is machine-specific. Warn but don't block — the user may know why.
+      if (base.env?.machineId && envSnap.machineId && base.env.machineId !== envSnap.machineId) {
+        console.log(`\n⚠ machine mismatch: baseline from ${base.env.machineId} (${base.env.hostname ?? "?"} · ${base.env.gpu?.[0]?.name ?? "no GPU"})`);
+        console.log(`                  current  from ${envSnap.machineId} (${envSnap.hostname ?? "?"} · ${envSnap.gpu?.[0]?.name ?? "no GPU"})`);
+        console.log(`  Deltas below will be dominated by hardware/driver differences, not your change.`);
+      }
+      envDiff(envSnap, base);
+    }
   }
 
   printSingleStream(singleStream, base);
@@ -399,7 +471,8 @@ async function main() {
   printConcurrent(concurrent, base);
 
   if (cmd === "compare" && base) {
-    console.log(`\nregression threshold: ${REG_PCT}% slower flags ⚠`);
+    const hasCv = base.singleStream?.some(r => r.cv);
+    console.log(`\nregression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`);
   }
 }
 
