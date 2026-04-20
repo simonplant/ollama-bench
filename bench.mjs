@@ -369,6 +369,47 @@ async function env() {
 }
 
 // ── Reporting ────────────────────────────────────────────────────────────────
+// Color + formatting. Auto-off when stdout is piped or NO_COLOR is set, so
+// copy-paste into tickets stays clean.
+const USE_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+const ANSI = {
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m", cyan: "\x1b[36m",
+};
+const paint = (s, code) => USE_COLOR ? code + s + ANSI.reset : s;
+const col = {
+  bold:   s => paint(s, ANSI.bold),
+  dim:    s => paint(s, ANSI.dim),
+  green:  s => paint(s, ANSI.green),
+  red:    s => paint(s, ANSI.red),
+  yellow: s => paint(s, ANSI.yellow),
+  cyan:   s => paint(s, ANSI.cyan),
+};
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const vlen = s => s.replace(ANSI_RE, "").length;
+const fmtInt   = n => Math.round(n).toLocaleString("en-US");
+const fmtFloat = (n, d = 1) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+
+// Render a Unicode box-drawing table. columns: [{ label, align }]. rows: array
+// of arrays of pre-formatted cell strings (may contain ANSI codes — widths are
+// computed on visible length so coloring doesn't warp alignment).
+function renderTable(columns, rows) {
+  const widths = columns.map((c, i) => Math.max(vlen(c.label), ...rows.map(r => vlen(r[i] ?? ""))));
+  const padCell = (s, w, align) => {
+    const gap = Math.max(0, w - vlen(s));
+    return align === "r" ? " ".repeat(gap) + s : s + " ".repeat(gap);
+  };
+  const line = cells => "│ " + cells.map((c, i) => padCell(c, widths[i], columns[i].align ?? "l")).join(" │ ") + " │";
+  const bar = (l, m, r) => l + widths.map(w => "─".repeat(w + 2)).join(m) + r;
+  return [
+    bar("┌", "┬", "┐"),
+    line(columns.map(c => col.cyan(c.label))),
+    bar("├", "┼", "┤"),
+    ...rows.map(line),
+    bar("└", "┴", "┘"),
+  ].join("\n");
+}
+
 function pctDelta(cur, base) {
   if (!base || base === 0) return null;
   return ((cur - base) / base) * 100;
@@ -387,10 +428,12 @@ function isRegression(d, better, cvBaseline) {
   return better === "higher" ? d < -thr : d > thr;
 }
 function fmtDelta(d, better = "higher", cvBaseline) {
-  if (d === null) return "     —";
+  if (d === null) return col.dim("—");
   const sign = d >= 0 ? "+" : "";
-  const marker = isRegression(d, better, cvBaseline) ? " ⚠" : "";
-  return `${sign}${d.toFixed(1)}%${marker}`.padStart(8);
+  const text = `${sign}${d.toFixed(1)}%`;
+  if (isRegression(d, better, cvBaseline)) return col.red(`${text} ⚠`);
+  const improved = better === "higher" ? d > 0 : d < 0;
+  return improved ? col.green(text) : col.dim(text);
 }
 
 // Walk every comparable cell and collect the ones past threshold. Used for the
@@ -429,50 +472,107 @@ function collectRegressions(cur, base) {
   return regs;
 }
 
-function printSingleStream(cur, base) {
-  console.log("\n[single-stream generation]");
-  console.log("ctx       | prompt t/s |  gen t/s  | total ms  |  Δ prompt  |   Δ gen    |  Δ total");
-  console.log("-".repeat(93));
-  for (const row of cur) {
-    const b = base?.singleStream?.find(r => r.ctx === row.ctx);
-    console.log(
-      row.ctx.padEnd(10) + "| " +
-      row.promptTps.toFixed(0).padStart(10) + " | " +
-      row.genTps.toFixed(1).padStart(9) + " | " +
-      row.totalMs.toFixed(0).padStart(9) + " | " +
-      (b ? fmtDelta(pctDelta(row.promptTps, b.promptTps), "higher", b.cv?.promptTps) : "     —  ") + " | " +
-      (b ? fmtDelta(pctDelta(row.genTps, b.genTps), "higher", b.cv?.genTps)          : "     —  ") + " | " +
-      (b ? fmtDelta(pctDelta(row.totalMs, b.totalMs), "lower", b.cv?.totalMs)        : "     —")
-    );
+function printHeadline(cur, envSnap) {
+  const short = cur.singleStream.find(r => r.ctx === "short") ?? cur.singleStream[0];
+  const longGen = cur.singleStream.find(r => r.ctx === "long-gen") ?? short;
+  const n1 = cur.concurrent.find(r => r.parallel === 1);
+  const nMax = cur.concurrent[cur.concurrent.length - 1];
+  const np = envSnap?.ollamaServerEnv?.OLLAMA_NUM_PARALLEL;
+  const serialized = np === "1" || np == null;
+
+  console.log("\n" + col.bold("Summary"));
+  const label = s => col.dim(s.padEnd(22));
+  const bold = (n, suffix) => col.bold(n) + (suffix ? col.dim(suffix) : "");
+
+  console.log("  " + label("Single-user chat") + bold(fmtFloat(short.genTps, 0) + " tok/s") + col.dim(`  (short prompt)`));
+  console.log("  " + label("Long generations")  + bold(fmtFloat(longGen.genTps, 0) + " tok/s") + col.dim(`  (sustained)`));
+  console.log("  " + label("Cold start")        + bold(fmtFloat(cur.coldStart.loadMs / 1000, 1) + "s") + col.dim(" model load + ") + bold(fmtFloat(cur.coldStart.firstPromptWallMs / 1000, 1) + "s") + col.dim(" first prompt"));
+  if (serialized && nMax && n1) {
+    const perCallerAvg = nMax.e2eGenTps / nMax.parallel;
+    console.log("  " + label("Concurrency") + col.yellow("serialized") + col.dim(`  NUM_PARALLEL=${np ?? "unset"} — ${nMax.parallel} callers share ~${fmtFloat(nMax.e2eGenTps, 0)} tok/s (≈${fmtFloat(perCallerAvg, 0)} each)`));
+  } else if (nMax) {
+    console.log("  " + label("Concurrency") + col.green("parallel") + col.dim(`  NUM_PARALLEL=${np} — ${nMax.parallel} callers total ${fmtFloat(nMax.e2eGenTps, 0)} tok/s`));
   }
 }
 
-function printColdStart(cur, base) {
-  console.log("\n[cold-start]");
-  console.log(`load ms:              ${cur.loadMs.toFixed(0).padStart(7)}${base ? "   Δ " + fmtDelta(pctDelta(cur.loadMs, base.coldStart.loadMs), "lower") : ""}`);
-  console.log(`first prompt wall ms: ${cur.firstPromptWallMs.toFixed(0).padStart(7)}${base ? "   Δ " + fmtDelta(pctDelta(cur.firstPromptWallMs, base.coldStart.firstPromptWallMs), "lower") : ""}`);
-  console.log(`gen t/s:              ${cur.genTps.toFixed(1).padStart(7)}${base ? "   Δ " + fmtDelta(pctDelta(cur.genTps, base.coldStart.genTps)) : ""}`);
+function printSingleStream(cur, base) {
+  console.log("\n" + col.bold("[single-stream generation]"));
+  const columns = [
+    { label: "ctx",        align: "l" },
+    { label: "prompt t/s", align: "r" },
+    { label: "gen t/s",    align: "r" },
+    { label: "total ms",   align: "r" },
+    { label: "Δ prompt",   align: "r" },
+    { label: "Δ gen",      align: "r" },
+    { label: "Δ total",    align: "r" },
+  ];
+  const rows = cur.map(row => {
+    const b = base?.singleStream?.find(r => r.ctx === row.ctx);
+    return [
+      row.ctx,
+      fmtInt(row.promptTps),
+      fmtFloat(row.genTps, 1),
+      fmtInt(row.totalMs),
+      b ? fmtDelta(pctDelta(row.promptTps, b.promptTps), "higher", b.cv?.promptTps) : col.dim("—"),
+      b ? fmtDelta(pctDelta(row.genTps,    b.genTps),    "higher", b.cv?.genTps)    : col.dim("—"),
+      b ? fmtDelta(pctDelta(row.totalMs,   b.totalMs),   "lower",  b.cv?.totalMs)   : col.dim("—"),
+    ];
+  });
+  console.log(renderTable(columns, rows));
 }
 
-function printConcurrent(cur, base) {
-  console.log("\n[concurrent streams]   e2e = end-to-end t/s (includes prompt-eval + network)");
-  console.log("                       decode = aggregate pure-decode t/s");
-  console.log("parallel | e2e t/s | decode t/s | per-stream t/s |  Δ e2e   | Δ decode |  Δ per-stream");
-  console.log("-".repeat(92));
-  for (const row of cur) {
+function printColdStart(cur, base) {
+  console.log("\n" + col.bold("[cold-start]"));
+  const columns = [
+    { label: "metric", align: "l" },
+    { label: "value",  align: "r" },
+    { label: "Δ",      align: "r" },
+  ];
+  const rows = [
+    ["load ms",              fmtInt(cur.loadMs),            base ? fmtDelta(pctDelta(cur.loadMs,            base.coldStart.loadMs),            "lower")  : col.dim("—")],
+    ["first prompt wall ms", fmtInt(cur.firstPromptWallMs), base ? fmtDelta(pctDelta(cur.firstPromptWallMs, base.coldStart.firstPromptWallMs), "lower")  : col.dim("—")],
+    ["gen t/s",              fmtFloat(cur.genTps, 1),       base ? fmtDelta(pctDelta(cur.genTps,            base.coldStart.genTps),            "higher") : col.dim("—")],
+  ];
+  console.log(renderTable(columns, rows));
+}
+
+function printConcurrent(cur, base, envSnap) {
+  console.log("\n" + col.bold("[concurrent streams]") + col.dim("   e2e = total tokens ÷ wall; decode = aggregate pure-decode"));
+  const columns = [
+    { label: "parallel",       align: "r" },
+    { label: "e2e t/s",        align: "r" },
+    { label: "decode t/s",     align: "r" },
+    { label: "per-stream t/s", align: "r" },
+    { label: "Δ e2e",          align: "r" },
+    { label: "Δ decode",       align: "r" },
+    { label: "Δ per-stream",   align: "r" },
+  ];
+  const rows = cur.map(row => {
     const b = base?.concurrent?.find(r => r.parallel === row.parallel);
     // Support old baselines that used `aggGenTps` as the only aggregate.
-    const bE2e = b ? (b.e2eGenTps ?? b.aggGenTps) : undefined;
+    const bE2e   = b ? (b.e2eGenTps ?? b.aggGenTps) : undefined;
     const bE2eCv = b ? (b.cv?.e2eGenTps ?? b.cv?.aggGenTps) : undefined;
-    console.log(
-      String(row.parallel).padStart(8) + " | " +
-      row.e2eGenTps.toFixed(1).padStart(7) + " | " +
-      row.decodeGenTps.toFixed(1).padStart(10) + " | " +
-      row.perStreamGenTps.toFixed(1).padStart(14) + " | " +
-      (bE2e !== undefined ? fmtDelta(pctDelta(row.e2eGenTps, bE2e), "higher", bE2eCv) : "     —  ") + " | " +
-      (b?.decodeGenTps !== undefined ? fmtDelta(pctDelta(row.decodeGenTps, b.decodeGenTps), "higher", b.cv?.decodeGenTps) : "     —  ") + " | " +
-      (b ? fmtDelta(pctDelta(row.perStreamGenTps, b.perStreamGenTps), "higher", b.cv?.perStreamGenTps) : "     —")
-    );
+    return [
+      String(row.parallel),
+      fmtFloat(row.e2eGenTps, 1),
+      fmtFloat(row.decodeGenTps, 1),
+      fmtFloat(row.perStreamGenTps, 1),
+      bE2e !== undefined            ? fmtDelta(pctDelta(row.e2eGenTps,       bE2e),              "higher", bE2eCv)               : col.dim("—"),
+      b?.decodeGenTps !== undefined ? fmtDelta(pctDelta(row.decodeGenTps,    b.decodeGenTps),    "higher", b.cv?.decodeGenTps)    : col.dim("—"),
+      b                             ? fmtDelta(pctDelta(row.perStreamGenTps, b.perStreamGenTps), "higher", b.cv?.perStreamGenTps) : col.dim("—"),
+    ];
+  });
+  console.log(renderTable(columns, rows));
+
+  // With NUM_PARALLEL=1 the requests are serialized — the "decode t/s" column
+  // looks like it scales, but that's an artifact of totalGen / max(eval_duration)
+  // when each stream's eval_duration covers only its own turn. Flag this so a
+  // first-time reader doesn't misread the table as showing real batching.
+  const np = envSnap?.ollamaServerEnv?.OLLAMA_NUM_PARALLEL;
+  if (np === "1" || np == null) {
+    console.log(col.dim(`  note: OLLAMA_NUM_PARALLEL=${np ?? "unset"} — Ollama serializes requests on one slot.`));
+    console.log(col.dim(`        "decode t/s" scaling is a metric artifact, not real batching.`));
+    console.log(col.dim(`        Raise NUM_PARALLEL to actually batch concurrent callers.`));
   }
 }
 
@@ -592,22 +692,23 @@ async function runPerf(mode) {
     base = null;
   }
 
+  printHeadline(current, envSnap);
   printSingleStream(singleStream, base);
   printColdStart(coldStart, base);
-  printConcurrent(concurrent, base);
+  printConcurrent(concurrent, base, envSnap);
 
   if (resolved === "compare" && base) {
     const regs = collectRegressions(current, base);
     if (regs.length === 0) {
-      console.log("\n✓ no regressions");
+      console.log("\n" + col.green("✓ no regressions"));
     } else {
       const shown = regs.slice(0, 8);
       const overflow = regs.length - shown.length;
       const tail = overflow > 0 ? `, …and ${overflow} more` : "";
-      console.log(`\n⚠ ${regs.length} cell${regs.length === 1 ? "" : "s"} regressed: ${shown.join(", ")}${tail}`);
+      console.log("\n" + col.red(`⚠ ${regs.length} cell${regs.length === 1 ? "" : "s"} regressed`) + ": " + shown.join(", ") + tail);
     }
     const hasCv = base.singleStream?.some(r => r.cv);
-    console.log(`regression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`);
+    console.log(col.dim(`regression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`));
   }
 }
 
