@@ -45,8 +45,11 @@ Flags (any order, any subcommand):
 
 Environment variables the wrapper respects:
 - `OLLAMA_BENCH_CONTAINER` — sibling container name (needs Node 20+ and network access to Ollama). Auto-tries `openclaw` then `engine-openclaw-1`.
+- `OLLAMA_BENCH_OLLAMA_CONTAINER` — name of the Ollama container whose `OLLAMA_*` env the wrapper reads via `docker inspect` for the env snapshot. Default `ollama`.
 - `OLLAMA_BENCH_REMOTE_DIR` — writable path inside the container (default `/tmp`).
 - `OLLAMA_BENCH_MACHINE_ID` — stable fingerprint seed. Auto-populated from `/etc/machine-id` (or `/var/lib/dbus/machine-id`). Set manually only if your host doesn't expose one.
+
+The wrapper also runs `nvidia-smi` and `docker inspect <ollama>` on the host and forwards the results into the sibling as `OLLAMA_BENCH_GPU_CSV` / `OLLAMA_BENCH_SERVER_ENV_JSON`. `bench.mjs` prefers these over its own in-container probes, so GPU state and `OLLAMA_NUM_PARALLEL` always land in the baseline even when the sibling has no `nvidia-smi` or docker socket.
 
 The wrapper copies all four harness files (`bench.mjs`, `bench-toolcall.mjs`, `bench-multiturn.mjs`, `bench-tools.mjs`) into the sibling under `$OLLAMA_BENCH_REMOTE_DIR` and fails fast with a named file list if any are missing on the host. Baseline syncs back to `./baseline.json` on the host only when content changed during the run — no mtime churn on no-op invocations.
 

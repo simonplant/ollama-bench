@@ -13,6 +13,7 @@
 #
 # Usage: same as `node bench.mjs`. Passes all arguments through.
 #   ./bench                  # smart perf run
+#   ./bench doctor           # preflight system audit
 #   ./bench perf save        # save new baseline
 #   ./bench toolcall         # tool-call probe
 #   ./bench all              # everything
@@ -46,7 +47,7 @@ REMOTE_BASELINE="$REMOTE_DIR/ollama-bench-baseline.json"
 # The unified CLI spawns the probe scripts as siblings, and both probes
 # import the shared tool catalogue, so all four files must live next to
 # each other in the container. Fail fast if any are missing on the host.
-SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs)
+SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs bench-doctor.mjs)
 MISSING=()
 for script in "${SCRIPTS[@]}"; do
   [[ -f "$HERE/$script" ]] || MISSING+=("$script")
@@ -67,6 +68,36 @@ for f in /etc/machine-id /var/lib/dbus/machine-id; do
   if [[ -r "$f" ]]; then HOST_MACHINE_ID=$(cat "$f" 2>/dev/null || true); break; fi
 done
 
+# Env snapshot — the sibling container typically has neither nvidia-smi on
+# PATH nor access to the Docker socket, so bench.mjs's in-container probes
+# for GPU state and OLLAMA_* server env come back empty. Run them on the
+# host and forward via env vars; bench.mjs prefers injected data over its
+# own local commands.
+HOST_NVIDIA_SMI=""
+HOST_NVIDIA_SMI_EXT=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  HOST_NVIDIA_SMI=$(nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm --format=csv,noheader,nounits 2>/dev/null) || HOST_NVIDIA_SMI=""
+  # Extended field set consumed by bench-doctor.mjs (GPU_FIELDS there must match).
+  HOST_NVIDIA_SMI_EXT=$(nvidia-smi --query-gpu=name,driver_version,persistence_mode,power.default_limit,power.max_limit,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null) || HOST_NVIDIA_SMI_EXT=""
+fi
+
+# Host-only probes for bench-doctor. The sibling container can't read the
+# host's sysfs or /proc, so snapshot on the host and forward via env.
+HOST_CPU_GOVERNOR=""
+if ls /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1; then
+  HOST_CPU_GOVERNOR=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true)
+fi
+HOST_SWAP=""
+if command -v free >/dev/null 2>&1; then
+  HOST_SWAP=$(free -m | awk '/^Swap:/ {print $2, $3}' 2>/dev/null || true)
+fi
+
+OLLAMA_CONTAINER="${OLLAMA_BENCH_OLLAMA_CONTAINER:-ollama}"
+HOST_OLLAMA_ENV=""
+if docker ps --filter "name=^${OLLAMA_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -qx "$OLLAMA_CONTAINER"; then
+  HOST_OLLAMA_ENV=$(docker inspect "$OLLAMA_CONTAINER" --format '{{json .Config.Env}}' 2>/dev/null) || HOST_OLLAMA_ENV=""
+fi
+
 # Seed baseline from host if we have one. Capture content hash so we can
 # detect mutation after the run without being fooled by mtime bumps from
 # the copy-in itself.
@@ -83,6 +114,29 @@ fi
 EXEC_ENV=()
 if [[ -n "$HOST_MACHINE_ID" ]]; then
   EXEC_ENV+=(-e "OLLAMA_BENCH_MACHINE_ID=$HOST_MACHINE_ID")
+fi
+# Export + `-e KEY` (no value) is the robust form for multi-line / JSON
+# payloads: docker forwards the variable from the wrapper's environment
+# rather than trying to parse it as a KEY=VAL argument.
+if [[ -n "$HOST_NVIDIA_SMI" ]]; then
+  export OLLAMA_BENCH_GPU_CSV="$HOST_NVIDIA_SMI"
+  EXEC_ENV+=(-e OLLAMA_BENCH_GPU_CSV)
+fi
+if [[ -n "$HOST_NVIDIA_SMI_EXT" ]]; then
+  export OLLAMA_BENCH_GPU_EXT_CSV="$HOST_NVIDIA_SMI_EXT"
+  EXEC_ENV+=(-e OLLAMA_BENCH_GPU_EXT_CSV)
+fi
+if [[ -n "$HOST_OLLAMA_ENV" ]]; then
+  export OLLAMA_BENCH_SERVER_ENV_JSON="$HOST_OLLAMA_ENV"
+  EXEC_ENV+=(-e OLLAMA_BENCH_SERVER_ENV_JSON)
+fi
+if [[ -n "$HOST_CPU_GOVERNOR" ]]; then
+  export OLLAMA_BENCH_CPU_GOVERNOR="$HOST_CPU_GOVERNOR"
+  EXEC_ENV+=(-e OLLAMA_BENCH_CPU_GOVERNOR)
+fi
+if [[ -n "$HOST_SWAP" ]]; then
+  export OLLAMA_BENCH_SWAP="$HOST_SWAP"
+  EXEC_ENV+=(-e OLLAMA_BENCH_SWAP)
 fi
 set +e
 docker exec "${EXEC_ENV[@]}" "$CONTAINER" node "$REMOTE_DIR/bench.mjs" "$@" --out "$REMOTE_BASELINE"

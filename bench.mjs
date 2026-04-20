@@ -10,6 +10,7 @@
  *   perf [save|compare|run]   Throughput benchmark. No mode → smart default.
  *   toolcall                  Single-turn tool-call accuracy probe.
  *   multiturn                 Multi-turn tool-call probe (post-tool-result).
+ *   doctor                    Preflight system audit — flags GPU/Ollama/host misconfigs.
  *   all                       perf (smart) → toolcall → multiturn, sequentially.
  *   baseline [show|clear]     Inspect or delete baseline.json.
  *   help                      Print usage.
@@ -292,10 +293,12 @@ async function env() {
     }
   } catch {}
 
-  // GPU state — skipped silently when nvidia-smi isn't on PATH (e.g. CPU-only
-  // or when running inside a container without the nvidia runtime mapping).
+  // GPU state — prefer host-injected CSV (Docker-sibling flow: sibling rarely
+  // has nvidia-smi, so the wrapper runs it on the host and forwards results).
+  // Fall back to local nvidia-smi for direct host invocation.
   let gpu = null;
-  const nvOut = tryExec("nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm --format=csv,noheader,nounits");
+  const nvOut = process.env.OLLAMA_BENCH_GPU_CSV
+    || tryExec("nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm --format=csv,noheader,nounits");
   if (nvOut) {
     const lines = nvOut.split("\n").filter(Boolean);
     gpu = lines.map(l => {
@@ -306,10 +309,12 @@ async function env() {
 
   // Ollama server env — OLLAMA_NUM_PARALLEL governs whether concurrent
   // requests batch or serialize, so it's the #1 concurrency-shape variable.
-  // Read via `docker inspect` when Ollama runs as a container; otherwise
-  // fall back to the host env.
+  // Prefer host-injected JSON (Docker-sibling flow: sibling has no docker
+  // socket, so the wrapper runs `docker inspect` on the host and forwards).
+  // Fall back to local `docker inspect`, then host env.
   let ollamaServerEnv = null;
-  const dockerEnv = tryExec("docker inspect ollama --format '{{json .Config.Env}}' 2>/dev/null");
+  const dockerEnv = process.env.OLLAMA_BENCH_SERVER_ENV_JSON
+    || tryExec("docker inspect ollama --format '{{json .Config.Env}}' 2>/dev/null");
   if (dockerEnv) {
     try {
       const arr = JSON.parse(dockerEnv);
@@ -376,13 +381,52 @@ function thresholdFor(cvBaseline) {
   const noiseFloor = typeof cvBaseline === "number" ? 2 * cvBaseline : 0;
   return Math.max(REG_PCT, noiseFloor);
 }
+function isRegression(d, better, cvBaseline) {
+  if (d === null) return false;
+  const thr = thresholdFor(cvBaseline);
+  return better === "higher" ? d < -thr : d > thr;
+}
 function fmtDelta(d, better = "higher", cvBaseline) {
   if (d === null) return "     —";
   const sign = d >= 0 ? "+" : "";
-  const thr = thresholdFor(cvBaseline);
-  const isRegression = better === "higher" ? d < -thr : d > thr;
-  const marker = isRegression ? " ⚠" : "";
+  const marker = isRegression(d, better, cvBaseline) ? " ⚠" : "";
   return `${sign}${d.toFixed(1)}%${marker}`.padStart(8);
+}
+
+// Walk every comparable cell and collect the ones past threshold. Used for the
+// end-of-run verdict line so the user doesn't have to scan three tables.
+function collectRegressions(cur, base) {
+  const regs = [];
+  const check = (label, c, b, better, cv) => {
+    if (b === undefined || b === null) return;
+    const d = pctDelta(c, b);
+    if (isRegression(d, better, cv)) {
+      const sign = d >= 0 ? "+" : "";
+      regs.push(`${label} ${sign}${d.toFixed(1)}%`);
+    }
+  };
+  for (const row of cur.singleStream ?? []) {
+    const b = base?.singleStream?.find(r => r.ctx === row.ctx);
+    if (!b) continue;
+    check(`${row.ctx} prompt t/s`, row.promptTps, b.promptTps, "higher", b.cv?.promptTps);
+    check(`${row.ctx} gen t/s`,    row.genTps,    b.genTps,    "higher", b.cv?.genTps);
+    check(`${row.ctx} total ms`,   row.totalMs,   b.totalMs,   "lower",  b.cv?.totalMs);
+  }
+  if (base?.coldStart && cur.coldStart) {
+    check("cold-start load ms",       cur.coldStart.loadMs,            base.coldStart.loadMs,            "lower");
+    check("cold-start first wall ms", cur.coldStart.firstPromptWallMs, base.coldStart.firstPromptWallMs, "lower");
+    check("cold-start gen t/s",       cur.coldStart.genTps,            base.coldStart.genTps,            "higher");
+  }
+  for (const row of cur.concurrent ?? []) {
+    const b = base?.concurrent?.find(r => r.parallel === row.parallel);
+    if (!b) continue;
+    const bE2e   = b.e2eGenTps   ?? b.aggGenTps;
+    const bE2eCv = b.cv?.e2eGenTps ?? b.cv?.aggGenTps;
+    check(`n=${row.parallel} e2e t/s`,        row.e2eGenTps,       bE2e,              "higher", bE2eCv);
+    check(`n=${row.parallel} decode t/s`,     row.decodeGenTps,    b.decodeGenTps,    "higher", b.cv?.decodeGenTps);
+    check(`n=${row.parallel} per-stream t/s`, row.perStreamGenTps, b.perStreamGenTps, "higher", b.cv?.perStreamGenTps);
+  }
+  return regs;
 }
 
 function printSingleStream(cur, base) {
@@ -553,8 +597,17 @@ async function runPerf(mode) {
   printConcurrent(concurrent, base);
 
   if (resolved === "compare" && base) {
+    const regs = collectRegressions(current, base);
+    if (regs.length === 0) {
+      console.log("\n✓ no regressions");
+    } else {
+      const shown = regs.slice(0, 8);
+      const overflow = regs.length - shown.length;
+      const tail = overflow > 0 ? `, …and ${overflow} more` : "";
+      console.log(`\n⚠ ${regs.length} cell${regs.length === 1 ? "" : "s"} regressed: ${shown.join(", ")}${tail}`);
+    }
     const hasCv = base.singleStream?.some(r => r.cv);
-    console.log(`\nregression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`);
+    console.log(`regression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`);
   }
 }
 
@@ -612,6 +665,7 @@ SUBCOMMANDS
   perf [mode]       Throughput benchmark. mode: save | compare | run | (smart).
   toolcall          Single-turn tool-call accuracy probe (22 cases).
   multiturn         Multi-turn tool-call probe, after fabricated tool result (14 cases).
+  doctor            Preflight audit: persistence mode, power cap, governor, KV/FA combo, etc.
   all               Run perf (smart) + toolcall + multiturn, sequentially.
   baseline [show]   Show baseline summary (default).
   baseline clear    Delete baseline.json.
@@ -627,6 +681,7 @@ FLAGS
 
 EXAMPLES
   ./bench                              # smart perf run
+  ./bench doctor                       # audit GPU/host/Ollama config
   ./bench perf save                    # force-save a new baseline
   ./bench toolcall -v                  # accuracy probe, per-case output
   ./bench all --model qwen3:30b        # compare a different model end-to-end
@@ -662,6 +717,8 @@ async function main() {
       return spawnSibling("bench-toolcall.mjs");
     case "multiturn":
       return spawnSibling("bench-multiturn.mjs");
+    case "doctor":
+      return spawnSibling("bench-doctor.mjs");
     case "all":
       return runAll();
     case "baseline":
