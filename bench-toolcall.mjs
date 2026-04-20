@@ -11,8 +11,10 @@
  *   - tool_call_expected + got_call + right_name + args_superset(expected) → PASS
  *   - tool_call_expected=false + no_call_produced                           → PASS
  *   - otherwise FAIL
- * Schema score: arguments parse as JSON and every declared-required key is
- * present with a non-empty value.
+ * Schema score is independent of tool-name correctness: arguments just need
+ * to parse as JSON and satisfy the required-keys check for whichever tool
+ * the model actually called. A wrong-tool pick with well-formed args still
+ * counts as valid schema fidelity — only malformed/missing args fail schema.
  */
 
 import { TOOLS } from "./bench-tools.mjs";
