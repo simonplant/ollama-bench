@@ -9,20 +9,20 @@
 #                            installed and network access to Ollama).
 #                            Default: tries "openclaw" then "engine-openclaw-1".
 #   OLLAMA_BENCH_REMOTE_DIR  writable path inside the container to stage the
-#                            script + baseline. Default: /tmp
+#                            scripts + baseline. Default: /tmp
 #
-# Usage:
-#   bench save       — run and record baseline.json
-#   bench compare    — run and show deltas vs baseline.json
-#   bench run        — run without touching baseline
+# Usage: same as `node bench.mjs`. Passes all arguments through.
+#   ./bench                  # smart perf run
+#   ./bench perf save        # save new baseline
+#   ./bench toolcall         # tool-call probe
+#   ./bench all              # everything
+#   ./bench --help           # usage
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$HERE/bench.mjs"
 BASELINE_HOST="$HERE/baseline.json"
 
-# Pick container: explicit override → openclaw → engine-openclaw-1
 CONTAINER="${OLLAMA_BENCH_CONTAINER:-}"
 if [[ -z "$CONTAINER" ]]; then
   for candidate in openclaw engine-openclaw-1; do
@@ -41,26 +41,67 @@ if ! docker ps --filter "name=^${CONTAINER}$" --format '{{.Names}}' | grep -qx "
 fi
 
 REMOTE_DIR="${OLLAMA_BENCH_REMOTE_DIR:-/tmp}"
-CMD="${1:-run}"; shift || true
-REMOTE_SCRIPT="$REMOTE_DIR/ollama-bench.mjs"
 REMOTE_BASELINE="$REMOTE_DIR/ollama-bench-baseline.json"
 
-# Copy script into container
-docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_SCRIPT" < "$SCRIPT"
+# The unified CLI spawns the probe scripts as siblings, and both probes
+# import the shared tool catalogue, so all four files must live next to
+# each other in the container. Fail fast if any are missing on the host.
+SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs)
+MISSING=()
+for script in "${SCRIPTS[@]}"; do
+  [[ -f "$HERE/$script" ]] || MISSING+=("$script")
+done
+if (( ${#MISSING[@]} > 0 )); then
+  echo "missing harness files next to wrapper: ${MISSING[*]}" >&2
+  exit 2
+fi
+for script in "${SCRIPTS[@]}"; do
+  docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_DIR/$script" < "$HERE/$script"
+done
 
-# Seed baseline from host
+# Stable machine fingerprint — read the host's machine-id and pass it in.
+# Without this, machineId hashes the container's hostname (= container id),
+# which changes on every recreate and invalidates the baseline.
+HOST_MACHINE_ID=""
+for f in /etc/machine-id /var/lib/dbus/machine-id; do
+  if [[ -r "$f" ]]; then HOST_MACHINE_ID=$(cat "$f" 2>/dev/null || true); break; fi
+done
+
+# Seed baseline from host if we have one. Capture content hash so we can
+# detect mutation after the run without being fooled by mtime bumps from
+# the copy-in itself.
 if [[ -f "$BASELINE_HOST" ]]; then
   docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_BASELINE" < "$BASELINE_HOST"
+  PRE_HASH=$(md5sum "$BASELINE_HOST" | cut -d' ' -f1)
+else
+  docker exec "$CONTAINER" rm -f "$REMOTE_BASELINE"
+  PRE_HASH=""
 fi
 
-# Run
-docker exec "$CONTAINER" node "$REMOTE_SCRIPT" "$CMD" --out "$REMOTE_BASELINE" "$@"
+# Inject --out so the script points at the in-container baseline path.
+# (User-supplied --out would be a host path and wouldn't exist inside the container.)
+EXEC_ENV=()
+if [[ -n "$HOST_MACHINE_ID" ]]; then
+  EXEC_ENV+=(-e "OLLAMA_BENCH_MACHINE_ID=$HOST_MACHINE_ID")
+fi
+set +e
+docker exec "${EXEC_ENV[@]}" "$CONTAINER" node "$REMOTE_DIR/bench.mjs" "$@" --out "$REMOTE_BASELINE"
 EXIT=$?
+set -e
 
-# Persist fresh baseline back to host
-if [[ "$CMD" == "save" && $EXIT -eq 0 ]]; then
-  docker exec "$CONTAINER" cat "$REMOTE_BASELINE" > "$BASELINE_HOST"
-  echo "host baseline: $BASELINE_HOST"
+# Sync baseline state back to host only if the run actually changed it
+# (content hash differs, or the file was deleted in-container).
+if [[ $EXIT -eq 0 ]]; then
+  if docker exec "$CONTAINER" test -f "$REMOTE_BASELINE"; then
+    POST_HASH=$(docker exec "$CONTAINER" md5sum "$REMOTE_BASELINE" | cut -d' ' -f1)
+    if [[ "$POST_HASH" != "$PRE_HASH" ]]; then
+      docker exec "$CONTAINER" cat "$REMOTE_BASELINE" > "$BASELINE_HOST"
+      echo "host baseline: $BASELINE_HOST"
+    fi
+  elif [[ -n "$PRE_HASH" ]]; then
+    rm -f "$BASELINE_HOST"
+    echo "host baseline cleared: $BASELINE_HOST"
+  fi
 fi
 
 exit $EXIT

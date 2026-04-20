@@ -33,27 +33,13 @@
  *   node bench-multiturn.mjs [--model gemma4:26b] [--host http://localhost:11434] [-v]
  */
 
+import { TOOLS } from "./bench-tools.mjs";
+
 const args = process.argv.slice(2);
 const arg = (n, fb) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : fb; };
 const MODEL = arg("--model", "gemma4:26b");
 const HOST  = arg("--host",  "http://ollama:11434");
 const VERBOSE = args.includes("-v");
-
-// ── Tool catalogue (shared shape with bench-toolcall) ────────────────────────
-const TOOLS = [
-  { type: "function", function: { name: "email_inbox", description: "List unread emails. Returns id, subject, from, date.",
-    parameters: { type: "object", properties: { limit: { type: "integer" } }, required: [] } } },
-  { type: "function", function: { name: "email_read", description: "Read email body by id.",
-    parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } } },
-  { type: "function", function: { name: "calendar_events", description: "List calendar events in a date range.",
-    parameters: { type: "object", properties: { start: { type: "string" }, end: { type: "string" } }, required: ["start", "end"] } } },
-  { type: "function", function: { name: "task_create", description: "Create a to-do item.",
-    parameters: { type: "object", properties: { title: { type: "string" }, due: { type: "string" } }, required: ["title"] } } },
-  { type: "function", function: { name: "quote", description: "Get a stock quote.",
-    parameters: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } } },
-  { type: "function", function: { name: "web_search", description: "Search the web.",
-    parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
-];
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 // rule: "FINAL" | "CHAIN:<tool>" | "EMPTY_OK"
@@ -86,13 +72,15 @@ const CASES = [
     toolResult: JSON.stringify({ id: "271", subject: "Board deck review", body: "Hi, the deck is in the shared drive. Let me know by EOD Thursday if the Q3 section needs changes. — Alice" }),
     rule: "FINAL" },
 
-  // Empty result — tool returned nothing, model must not re-call
+  // Empty result — tool returned nothing, model must not re-call.
+  // minContent: 1 lets a terse "none" / "no results" pass as a valid reply
+  // without requiring the model to pad it out.
   { cat: "empty", prompt: "Any unread emails?", firstTool: "email_inbox",
-    toolResult: "[]", rule: "FINAL" },
+    toolResult: "[]", rule: "FINAL", minContent: 1 },
   { cat: "empty", prompt: "What's on my calendar today?", firstTool: "calendar_events",
-    toolResult: "[]", rule: "FINAL" },
+    toolResult: "[]", rule: "FINAL", minContent: 1 },
   { cat: "empty", prompt: "Search for news about magenta alpacas.", firstTool: "web_search",
-    toolResult: "[]", rule: "FINAL" },
+    toolResult: "[]", rule: "FINAL", minContent: 1 },
 
   // Error result — tool failed, model should surface or handle
   { cat: "error", prompt: "Get the XYZZY quote.", firstTool: "quote",
@@ -169,7 +157,11 @@ async function runOne(c) {
       return { pass: false, stage: "turn2", reason: `unexpected tool call: ${secondCalls[0].function?.name}` };
     }
     const content = (m2.content ?? "").trim();
-    if (content.length < 10) return { pass: false, stage: "turn2", reason: `expected synthesis, got ${content.length}-char content` };
+    // `empty` cases get a terse pass bar — "None." is a valid reply to
+    // "any unread emails?" with result []. Synthesis cases keep the higher
+    // floor so a single "ok." doesn't register as a real summary.
+    const minLen = c.minContent ?? 10;
+    if (content.length < minLen) return { pass: false, stage: "turn2", reason: `expected synthesis, got ${content.length}-char content` };
     return { pass: true, stage: "turn2", reason: "synthesized" };
   }
 

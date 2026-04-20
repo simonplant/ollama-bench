@@ -15,85 +15,13 @@
  * present with a non-empty value.
  */
 
+import { TOOLS } from "./bench-tools.mjs";
+
 const args = process.argv.slice(2);
 const arg = (n, fb) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : fb; };
 const MODEL = arg("--model", "gemma4:26b");
 const HOST  = arg("--host",  "http://ollama:11434");
 const VERBOSE = args.includes("-v");
-
-// ── Tool catalogue (LifeOps-shaped) ──────────────────────────────────────────
-const TOOLS = [
-  {
-    type: "function", function: {
-      name: "email_inbox",
-      description: "List unread emails in the inbox. Returns id, subject, from, date.",
-      parameters: { type: "object", properties: {
-        limit: { type: "integer", description: "Max emails to return", default: 20 },
-        folder: { type: "string", description: "Folder name", default: "INBOX" }
-      }, required: [] },
-    },
-  },
-  {
-    type: "function", function: {
-      name: "email_read",
-      description: "Read the body of an email by id.",
-      parameters: { type: "object", properties: {
-        id: { type: "string", description: "Email id" }
-      }, required: ["id"] },
-    },
-  },
-  {
-    type: "function", function: {
-      name: "email_send",
-      description: "Send an email.",
-      parameters: { type: "object", properties: {
-        to:      { type: "string", description: "Recipient email address" },
-        subject: { type: "string" },
-        body:    { type: "string" },
-      }, required: ["to", "subject", "body"] },
-    },
-  },
-  {
-    type: "function", function: {
-      name: "calendar_events",
-      description: "List calendar events in a date range.",
-      parameters: { type: "object", properties: {
-        start: { type: "string", description: "ISO date (YYYY-MM-DD)" },
-        end:   { type: "string", description: "ISO date (YYYY-MM-DD)" },
-      }, required: ["start", "end"] },
-    },
-  },
-  {
-    type: "function", function: {
-      name: "task_create",
-      description: "Create a task in the to-do list.",
-      parameters: { type: "object", properties: {
-        title:    { type: "string" },
-        due:      { type: "string", description: "ISO date or natural language" },
-        priority: { type: "string", enum: ["low", "medium", "high"] },
-      }, required: ["title"] },
-    },
-  },
-  {
-    type: "function", function: {
-      name: "quote",
-      description: "Get a real-time stock quote.",
-      parameters: { type: "object", properties: {
-        symbol: { type: "string", description: "Ticker symbol, e.g. AAPL" }
-      }, required: ["symbol"] },
-    },
-  },
-  {
-    type: "function", function: {
-      name: "web_search",
-      description: "Search the web.",
-      parameters: { type: "object", properties: {
-        query: { type: "string" },
-        limit: { type: "integer", default: 5 }
-      }, required: ["query"] },
-    },
-  },
-];
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 // each case: { cat, prompt, expect: { call: bool, name?, args?: {required keys w/ expected value semantics} } }
@@ -151,18 +79,34 @@ function scoreCase(c, out) {
     return { pass: !got, schema: true, reason: got ? `called ${calls[0]?.function?.name} unnecessarily` : "no tool, correct" };
   }
   if (!got) return { pass: false, schema: false, reason: "expected tool call, got none" };
+
+  // Schema fidelity is scored against whatever tool the model actually
+  // called, independently of whether it was the right tool. That way the
+  // schema% column measures "does the model produce well-formed args",
+  // not "does it pick the right tool AND produce well-formed args".
   const first = calls[0];
-  if (first.function?.name !== c.expect.name) {
-    return { pass: false, schema: false, reason: `expected ${c.expect.name}, got ${first.function?.name}` };
-  }
+  const calledName = first.function?.name;
   let parsed;
-  try { parsed = JSON.parse(first.function.arguments ?? "{}"); }
-  catch { return { pass: false, schema: false, reason: `arguments not valid JSON: ${first.function.arguments?.slice(0, 80)}` }; }
-  const toolDef = TOOLS.find(t => t.function.name === c.expect.name)?.function;
-  const required = toolDef?.parameters?.required ?? [];
-  const missing = required.filter(k => !(k in parsed) || parsed[k] === "");
-  const schemaOk = missing.length === 0;
-  if (!schemaOk) return { pass: false, schema: false, reason: `missing required keys: ${missing.join(",")}` };
+  let schemaOk = false;
+  let schemaReason = "";
+  try { parsed = JSON.parse(first.function?.arguments ?? "{}"); }
+  catch { schemaReason = `arguments not valid JSON: ${first.function?.arguments?.slice(0, 80)}`; }
+  if (parsed) {
+    const calledDef = TOOLS.find(t => t.function.name === calledName)?.function;
+    if (!calledDef) {
+      schemaReason = `unknown tool: ${calledName}`;
+    } else {
+      const required = calledDef.parameters?.required ?? [];
+      const missing = required.filter(k => !(k in parsed) || parsed[k] === "");
+      schemaOk = missing.length === 0;
+      if (!schemaOk) schemaReason = `missing required keys: ${missing.join(",")}`;
+    }
+  }
+
+  if (calledName !== c.expect.name) {
+    return { pass: false, schema: schemaOk, reason: `expected ${c.expect.name}, got ${calledName}` };
+  }
+  if (!schemaOk) return { pass: false, schema: false, reason: schemaReason };
   // arg-level check (loose — expected is a subset the model MUST reach)
   if (c.expect.args) {
     for (const [k, v] of Object.entries(c.expect.args)) {

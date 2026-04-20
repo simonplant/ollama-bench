@@ -1,37 +1,58 @@
 #!/usr/bin/env node
 /**
- * Performance regression harness for local Ollama models.
+ * ollama-bench — unified CLI for throughput regression + tool-call probes.
  *
- * Goal: catch throughput regressions from configuration changes. Not a
- * capability benchmark — every run uses identical prompts so differences
- * come from the environment, not the workload.
+ * Default (no subcommand) runs the throughput benchmark with smart baseline
+ * behavior: saves a baseline on first run, compares against it on every run
+ * after. That's what a user expects from "just ./bench".
  *
- * Dimensions measured (each gets its own row):
- *   1. Single-stream generation throughput at 4 context sizes
- *   2. Prompt-eval throughput at those sizes (fresh prefix per run → no cache)
- *   3. Time-to-first-token (proxy: load_duration on a short warm prompt)
- *   4. Concurrency — 1/2/4/8 parallel streams, aggregate tokens/sec
+ * Subcommands:
+ *   perf [save|compare|run]   Throughput benchmark. No mode → smart default.
+ *   toolcall                  Single-turn tool-call accuracy probe.
+ *   multiturn                 Multi-turn tool-call probe (post-tool-result).
+ *   all                       perf (smart) → toolcall → multiturn, sequentially.
+ *   baseline [show|clear]     Inspect or delete baseline.json.
+ *   help                      Print usage.
  *
- * Workflow:
- *   bench-regression.mjs save       → runs and writes baseline.json
- *   bench-regression.mjs compare    → runs and diffs vs baseline.json
- *   bench-regression.mjs run        → runs and prints, no baseline touched
+ * Flags (apply to any subcommand that uses them):
+ *   --model <tag>             default gemma4:26b
+ *   --host <url>              default http://ollama:11434
+ *   --runs <n>                per-cell runs, default 3 (perf only)
+ *   --out <path>              baseline file, default ./baseline.json
+ *   --regression-pct <n>      flag threshold, default 5 (perf only)
+ *   -v, --verbose             per-case output (toolcall/multiturn)
  *
- * Flags:
- *   --model <name>    default gemma4:26b
- *   --host <url>      default http://ollama:11434
- *   --runs <n>        per-case runs, median reported; default 3
- *   --out <path>      baseline file; default ./baseline.json
- *   --regression-pct  threshold to flag (default 5 = 5% slower than baseline)
+ * Back-compat: `bench.mjs save|compare|run` still works, routes to `perf`.
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
-const cmd  = args[0] ?? "run";
-const arg = (n, fb) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : fb; };
+// lastIndexOf so later flags override earlier ones — lets the Docker wrapper
+// append --out <in-container-path> after user args without the user's host
+// path (or accidental earlier value) winning.
+const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
+
+// Flags that consume the next argv entry as their value. Anything else
+// starting with `-` is a boolean; anything else is positional.
+const VALUE_FLAGS = new Set(["--model", "--host", "--runs", "--out", "--regression-pct"]);
+function parseArgs(argv) {
+  const flags = [], positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (VALUE_FLAGS.has(a))        { flags.push(a, argv[++i] ?? ""); }
+    else if (a.startsWith("-"))    { flags.push(a); }
+    else                           { positional.push(a); }
+  }
+  return { flags, positional };
+}
+const PARSED = parseArgs(args);
 
 const MODEL     = arg("--model", "gemma4:26b");
 const HOST      = arg("--host",  "http://ollama:11434");
@@ -77,6 +98,11 @@ const CTX_SIZES = [
   { label: "long-gen",  pad: 180,  numPredict: 1024 },
 ];
 
+// Concurrency cell — medium prompt × short gen. Short gen keeps the wall
+// time reasonable at parallel=8; medium prompt is representative of real
+// chat turns. Edit here to change what the concurrency scenario measures.
+const CONCURRENT_CELL = { ctxIdx: 1, numPredict: 64 };
+
 // llama.cpp's prompt cache is prefix-sequential — a single different leading
 // token invalidates the cache for this prompt. Every call must therefore start
 // with a fresh token, otherwise prompt-eval t/s measures cache hits rather
@@ -113,12 +139,13 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
   const j = await res.json();
   return {
-    promptTokens: j.prompt_eval_count ?? 0,
-    genTokens:    j.eval_count ?? 0,
-    promptTps:    j.prompt_eval_count / (j.prompt_eval_duration / 1e9),
-    genTps:       j.eval_count / (j.eval_duration / 1e9),
-    totalMs:      j.total_duration / 1e6,
-    loadMs:       (j.load_duration ?? 0) / 1e6,
+    promptTokens:    j.prompt_eval_count ?? 0,
+    genTokens:       j.eval_count ?? 0,
+    promptTps:       j.prompt_eval_count / (j.prompt_eval_duration / 1e9),
+    genTps:          j.eval_count / (j.eval_duration / 1e9),
+    totalMs:         j.total_duration / 1e6,
+    loadMs:          (j.load_duration ?? 0) / 1e6,
+    evalDurationMs:  (j.eval_duration ?? 0) / 1e6,
   };
 }
 
@@ -181,10 +208,11 @@ async function scenarioSingleStream(isSave) {
 async function scenarioColdStart() {
   // Force model eviction by setting keep_alive=0s on a short request, then
   // measure the NEXT request's load_duration + time-to-useful-response.
-  await generate("bye", { keepAlive: "0s", numPredict: 1 });
+  // Prefix with PROCESS_NONCE so back-to-back runs don't share a prompt.
+  await generate(`[${PROCESS_NONCE}/cold/evict] bye`, { keepAlive: "0s", numPredict: 1 });
   await new Promise(r => setTimeout(r, 1500)); // let eviction settle
   const t0 = performance.now();
-  const out = await generate("Say hi in five words.", { numPredict: 16 });
+  const out = await generate(`[${PROCESS_NONCE}/cold/measure] Say hi in five words.`, { numPredict: 16 });
   const wall = performance.now() - t0;
   return { loadMs: out.loadMs, firstPromptWallMs: wall, genTps: out.genTps };
 }
@@ -192,23 +220,40 @@ async function scenarioColdStart() {
 async function scenarioConcurrent(isSave, levels = [1, 2, 4, 8]) {
   const results = [];
   const samplesHere = isSave ? Math.max(3, Math.ceil(RUNS / 2) + 2) : Math.max(1, Math.ceil(RUNS / 2));
+  const { ctxIdx, numPredict } = CONCURRENT_CELL;
   for (const n of levels) {
     const samples = [];
     for (let r = 0; r < samplesHere; r++) {
-      const prompts = Array.from({ length: n }, (_, k) => mkPrompt(1, r * 100 + k)); // short prompts
+      const prompts = Array.from({ length: n }, (_, k) => mkPrompt(ctxIdx, r * 100 + k));
       const t0 = performance.now();
-      const outs = await Promise.all(prompts.map(p => generate(p, { numPredict: 64 })));
+      const outs = await Promise.all(prompts.map(p => generate(p, { numPredict })));
       const wall = (performance.now() - t0) / 1000;
       const totalGen = outs.reduce((a, o) => a + o.genTokens, 0);
-      samples.push({ aggGenTps: totalGen / wall, perStreamGenTps: median(outs.map(o => o.genTps)) });
+      // e2e = end-to-end throughput including prompt-eval + network; what a
+      // caller experiences. decode = pure decoder aggregate; isolates batcher
+      // scaling by dividing out prompt-eval. max(eval_duration) is the wall
+      // time of the slowest stream's decode, i.e. the span during which all
+      // streams' decode overlapped.
+      const maxEvalSec = Math.max(...outs.map(o => o.evalDurationMs / 1000)) || wall;
+      samples.push({
+        e2eGenTps:       totalGen / wall,
+        decodeGenTps:    totalGen / maxEvalSec,
+        perStreamGenTps: median(outs.map(o => o.genTps)),
+      });
     }
-    const aggs = samples.map(s => s.aggGenTps);
-    const pers = samples.map(s => s.perStreamGenTps);
+    const e2es    = samples.map(s => s.e2eGenTps);
+    const decodes = samples.map(s => s.decodeGenTps);
+    const pers    = samples.map(s => s.perStreamGenTps);
     results.push({
       parallel: n,
-      aggGenTps:       median(aggs),
+      e2eGenTps:       median(e2es),
+      decodeGenTps:    median(decodes),
       perStreamGenTps: median(pers),
-      cv: isSave ? { aggGenTps: cvPct(aggs), perStreamGenTps: cvPct(pers) } : undefined,
+      cv: isSave ? {
+        e2eGenTps:       cvPct(e2es),
+        decodeGenTps:    cvPct(decodes),
+        perStreamGenTps: cvPct(pers),
+      } : undefined,
     });
   }
   return results;
@@ -281,16 +326,21 @@ async function env() {
   const kernel   = tryExec("uname -r");
 
   // Machine fingerprint — short hash over the fields that *define* which
-  // physical machine produced the numbers. Used to warn (not block) when a
-  // compare runs against a baseline from a different machine; different
-  // machines have different absolute t/s, and comparing them is meaningless.
-  const fingerprintSource = JSON.stringify({
-    gpuName: gpu?.[0]?.name ?? null,
-    gpuDriver: gpu?.[0]?.driver ?? null,
-    gpuMemTotalMiB: gpu?.[0]?.memTotalMiB ?? null,
-    hostname,
-    kernel,
-  });
+  // physical machine produced the numbers. When run inside a container,
+  // hostname is the (ephemeral) container id and gpu/server-env are null,
+  // so the fallback hash is unstable across container recreates. The
+  // wrapper passes in the host's /etc/machine-id via OLLAMA_BENCH_MACHINE_ID
+  // to give us a stable anchor; we prefer it when present.
+  const hostMachineId = process.env.OLLAMA_BENCH_MACHINE_ID || null;
+  const fingerprintSource = hostMachineId
+    ? JSON.stringify({ hostMachineId })
+    : JSON.stringify({
+        gpuName: gpu?.[0]?.name ?? null,
+        gpuDriver: gpu?.[0]?.driver ?? null,
+        gpuMemTotalMiB: gpu?.[0]?.memTotalMiB ?? null,
+        hostname,
+        kernel,
+      });
   const machineId = createHash("sha256").update(fingerprintSource).digest("hex").slice(0, 12);
 
   return {
@@ -307,6 +357,7 @@ async function env() {
     hostname,
     kernel,
     machineId,
+    hostMachineId,
     gpu,
     ollamaServerEnv,
   };
@@ -360,16 +411,22 @@ function printColdStart(cur, base) {
 }
 
 function printConcurrent(cur, base) {
-  console.log("\n[concurrent streams]");
-  console.log("parallel | agg t/s | per-stream t/s |  Δ agg   | Δ per-stream");
-  console.log("-".repeat(66));
+  console.log("\n[concurrent streams]   e2e = end-to-end t/s (includes prompt-eval + network)");
+  console.log("                       decode = aggregate pure-decode t/s");
+  console.log("parallel | e2e t/s | decode t/s | per-stream t/s |  Δ e2e   | Δ decode |  Δ per-stream");
+  console.log("-".repeat(92));
   for (const row of cur) {
     const b = base?.concurrent?.find(r => r.parallel === row.parallel);
+    // Support old baselines that used `aggGenTps` as the only aggregate.
+    const bE2e = b ? (b.e2eGenTps ?? b.aggGenTps) : undefined;
+    const bE2eCv = b ? (b.cv?.e2eGenTps ?? b.cv?.aggGenTps) : undefined;
     console.log(
       String(row.parallel).padStart(8) + " | " +
-      row.aggGenTps.toFixed(1).padStart(7) + " | " +
+      row.e2eGenTps.toFixed(1).padStart(7) + " | " +
+      row.decodeGenTps.toFixed(1).padStart(10) + " | " +
       row.perStreamGenTps.toFixed(1).padStart(14) + " | " +
-      (b ? fmtDelta(pctDelta(row.aggGenTps, b.aggGenTps), "higher", b.cv?.aggGenTps) : "     —  ") + " | " +
+      (bE2e !== undefined ? fmtDelta(pctDelta(row.e2eGenTps, bE2e), "higher", bE2eCv) : "     —  ") + " | " +
+      (b?.decodeGenTps !== undefined ? fmtDelta(pctDelta(row.decodeGenTps, b.decodeGenTps), "higher", b.cv?.decodeGenTps) : "     —  ") + " | " +
       (b ? fmtDelta(pctDelta(row.perStreamGenTps, b.perStreamGenTps), "higher", b.cv?.perStreamGenTps) : "     —")
     );
   }
@@ -417,22 +474,49 @@ function serverEnvSummary(env) {
   return Object.entries(e).map(([k, v]) => `${k}=${v}`).join(" ");
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-async function main() {
+function readBaseline(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch (e) {
+    console.error(`baseline at ${path} is unreadable (${e.message}) — delete it or run './bench baseline clear'`);
+    process.exit(1);
+  }
+}
+
+// ── Perf runner ──────────────────────────────────────────────────────────────
+// mode: "save" | "compare" | "run" | "smart"
+//   smart → compare if baseline exists (same machine), save if not, run otherwise.
+async function runPerf(mode) {
   const envSnap = await env();
+
+  // Resolve smart mode before announcing, so the header says what we're doing.
+  let resolved = mode;
+  let base = readBaseline(OUT);
+  if (mode === "smart") {
+    if (!base) {
+      resolved = "save";
+      console.log(`(no baseline at ${OUT} — saving one now; re-run after any change to see regressions)`);
+    } else if (base.env?.machineId && envSnap.machineId && base.env.machineId !== envSnap.machineId) {
+      resolved = "run";
+      console.log(`⚠ baseline is from a different machine (${base.env.machineId} vs ${envSnap.machineId}) — showing raw numbers, no compare.`);
+    } else {
+      resolved = "compare";
+    }
+  }
+
   console.log(`bench: model=${envSnap.model} host=${envSnap.host} runs=${RUNS} ollama=${envSnap.ollamaVersion} digest=${(envSnap.modelDigest ?? "").slice(0, 12)}`);
   const gpuLine = gpuStateSummary(envSnap);
   if (gpuLine) console.log(`gpu:   ${gpuLine}`);
   const srvLine = serverEnvSummary(envSnap);
   if (srvLine) console.log(`ollama env: ${srvLine}`);
-  // Warn if GPU is not idle — background work will skew numbers.
   if (envSnap.gpu?.[0] && envSnap.gpu[0].utilPct >= 10) {
     console.log(`⚠ GPU utilization ${envSnap.gpu[0].utilPct}% before run — numbers may be noisy`);
   }
   console.log("warming up…");
   await generate("ok?", { numPredict: 8 });
 
-  const isSave = cmd === "save";
+  const isSave = resolved === "save";
   if (isSave) console.log("(save mode — extra runs to measure per-cell noise)");
   console.log("\n[1/3] single-stream sizes…");
   const singleStream = await scenarioSingleStream(isSave);
@@ -443,20 +527,16 @@ async function main() {
 
   const current = { env: envSnap, singleStream, coldStart, concurrent };
 
-  if (cmd === "save") {
+  if (resolved === "save") {
     writeFileSync(OUT, JSON.stringify(current, null, 2));
     console.log(`\nbaseline saved → ${OUT}`);
+    base = null; // don't diff a just-saved baseline against itself
   }
 
-  const base = (cmd === "compare" && existsSync(OUT))
-    ? JSON.parse(readFileSync(OUT, "utf-8")) : null;
-
-  if (cmd === "compare") {
+  if (resolved === "compare") {
     if (!base) {
-      console.log(`\nno baseline at ${OUT} — run 'save' first`);
+      console.log(`\nno baseline at ${OUT} — run './bench perf save' first`);
     } else {
-      // Cross-machine compares produce noise-dominated deltas because absolute
-      // t/s is machine-specific. Warn but don't block — the user may know why.
       if (base.env?.machineId && envSnap.machineId && base.env.machineId !== envSnap.machineId) {
         console.log(`\n⚠ machine mismatch: baseline from ${base.env.machineId} (${base.env.hostname ?? "?"} · ${base.env.gpu?.[0]?.name ?? "no GPU"})`);
         console.log(`                  current  from ${envSnap.machineId} (${envSnap.hostname ?? "?"} · ${envSnap.gpu?.[0]?.name ?? "no GPU"})`);
@@ -464,15 +544,132 @@ async function main() {
       }
       envDiff(envSnap, base);
     }
+  } else {
+    base = null;
   }
 
   printSingleStream(singleStream, base);
   printColdStart(coldStart, base);
   printConcurrent(concurrent, base);
 
-  if (cmd === "compare" && base) {
+  if (resolved === "compare" && base) {
     const hasCv = base.singleStream?.some(r => r.cv);
     console.log(`\nregression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`);
+  }
+}
+
+// ── Subcommand dispatch ──────────────────────────────────────────────────────
+function spawnSibling(script) {
+  // Forward all flags+values; drop the first positional (the subcommand).
+  // Using PARSED avoids the earlier bug where the first flag-value entry
+  // could be mistaken for the subcommand.
+  const forwarded = [...PARSED.flags, ...PARSED.positional.slice(1)];
+  return new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, [join(SCRIPT_DIR, script), ...forwarded], { stdio: "inherit" });
+    p.on("exit", code => code === 0 ? resolve() : reject(new Error(`${script} exited ${code}`)));
+  });
+}
+
+async function runAll() {
+  console.log("=== [1/3] perf ===");
+  await runPerf("smart");
+  console.log("\n=== [2/3] toolcall ===");
+  await spawnSibling("bench-toolcall.mjs");
+  console.log("\n=== [3/3] multiturn ===");
+  await spawnSibling("bench-multiturn.mjs");
+}
+
+function cmdBaseline(sub) {
+  if (sub === "clear") {
+    if (!existsSync(OUT)) { console.log(`no baseline at ${OUT}`); return; }
+    unlinkSync(OUT);
+    console.log(`removed ${OUT}`);
+    return;
+  }
+  // default: show
+  if (!existsSync(OUT)) { console.log(`no baseline at ${OUT} — run './bench perf save' to create one`); return; }
+  const b = readBaseline(OUT);
+  console.log(`baseline: ${OUT}`);
+  console.log(`  saved:   ${b.env?.timestamp ?? "?"}`);
+  console.log(`  model:   ${b.env?.model ?? "?"} (digest ${(b.env?.modelDigest ?? "").slice(0, 12)})`);
+  console.log(`  host:    ${b.env?.host ?? "?"}`);
+  console.log(`  machine: ${b.env?.machineId ?? "?"} (${b.env?.hostname ?? "?"} · ${b.env?.gpu?.[0]?.name ?? "no GPU"})`);
+  console.log(`  ollama:  ${b.env?.ollamaVersion ?? "?"}`);
+  if (b.singleStream) {
+    console.log(`  single-stream gen t/s: ${b.singleStream.map(r => `${r.ctx}=${r.genTps.toFixed(1)}`).join("  ")}`);
+  }
+}
+
+function printHelp() {
+  console.log(`ollama-bench — throughput regression harness + tool-call probes
+
+USAGE
+  ./bench [subcommand] [flags]
+
+SUBCOMMANDS
+  (none)            Run throughput benchmark with smart baseline behavior:
+                    saves a baseline on first run, compares on every run after.
+  perf [mode]       Throughput benchmark. mode: save | compare | run | (smart).
+  toolcall          Single-turn tool-call accuracy probe (22 cases).
+  multiturn         Multi-turn tool-call probe, after fabricated tool result (14 cases).
+  all               Run perf (smart) + toolcall + multiturn, sequentially.
+  baseline [show]   Show baseline summary (default).
+  baseline clear    Delete baseline.json.
+  help              This message.
+
+FLAGS
+  --model <tag>            default gemma4:26b
+  --host <url>             default http://ollama:11434
+  --runs <n>               per-cell runs for perf, default 3
+  --out <path>             baseline file, default ./baseline.json
+  --regression-pct <n>     regression threshold, default 5 (%)
+  -v, --verbose            per-case output for toolcall/multiturn
+
+EXAMPLES
+  ./bench                              # smart perf run
+  ./bench perf save                    # force-save a new baseline
+  ./bench toolcall -v                  # accuracy probe, per-case output
+  ./bench all --model qwen3:30b        # compare a different model end-to-end
+  ./bench baseline clear               # start fresh
+
+Back-compat: 'save'/'compare'/'run' at the top level still work, routed to 'perf'.`);
+}
+
+// ── Main dispatcher ──────────────────────────────────────────────────────────
+async function main() {
+  const { positional } = PARSED;
+  if (args.includes("--help") || args.includes("-h") || positional[0] === "help") {
+    printHelp();
+    return;
+  }
+
+  const cmd = positional[0] ?? "";
+  const sub = positional[1] ?? "";
+
+  switch (cmd) {
+    case "":
+      return runPerf("smart");
+    case "perf":
+      if (sub && !["save", "compare", "run"].includes(sub)) {
+        console.error(`unknown perf mode: ${sub} (expected save|compare|run)`);
+        process.exit(2);
+      }
+      return runPerf(sub || "smart");
+    // Back-compat: bare save/compare/run at top level
+    case "save": case "compare": case "run":
+      return runPerf(cmd);
+    case "toolcall":
+      return spawnSibling("bench-toolcall.mjs");
+    case "multiturn":
+      return spawnSibling("bench-multiturn.mjs");
+    case "all":
+      return runAll();
+    case "baseline":
+      return cmdBaseline(sub || "show");
+    default:
+      console.error(`unknown command: ${cmd}\n`);
+      printHelp();
+      process.exit(2);
   }
 }
 
