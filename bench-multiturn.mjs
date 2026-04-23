@@ -30,16 +30,26 @@
  *   - more than 1 tool_call when only 1 was expected
  *
  * Usage:
- *   node bench-multiturn.mjs [--model gemma4:26b] [--host http://localhost:11434] [-v]
+ *   node bench-multiturn.mjs [--model gemma4:26b] [--host http://localhost:11434]
+ *                            [--out ./baseline.json] [--save|--compare] [-v]
+ *
+ * Default (no --save/--compare) is smart mode: saves if no multiturn section
+ * in the baseline, compares otherwise.
  */
 
 import { TOOLS } from "./bench-tools.mjs";
+import { read, writeMerge } from "./bench-baseline.mjs";
 
 const args = process.argv.slice(2);
-const arg = (n, fb) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : fb; };
-const MODEL = arg("--model", "gemma4:26b");
-const HOST  = arg("--host",  "http://ollama:11434");
+// lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
+const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
+const MODEL   = arg("--model", "gemma4:26b");
+const HOST    = arg("--host",  "http://ollama:11434");
+const OUT     = arg("--out",   "./baseline.json");
 const VERBOSE = args.includes("-v");
+const MODE    = args.includes("--save")    ? "save"
+              : args.includes("--compare") ? "compare"
+              : "smart";
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 // rule: "FINAL" | "CHAIN:<tool>" | "EMPTY_OK"
@@ -102,7 +112,7 @@ const CASES = [
     rule: "CHAIN:task_create" },
 
   // Long result (~2K chars) — synthesis should still work, not loop
-  { cat: "synthesis", prompt: "Show me my inbox.", firstTool: "email_inbox",
+  { cat: "synthesis", prompt: "Show me my inbox (recent).", firstTool: "email_inbox",
     toolResult: JSON.stringify(Array.from({ length: 30 }, (_, i) => ({
       id: String(300 + i),
       subject: `Update ${i + 1} — progress notes from the team meeting this week`,
@@ -175,11 +185,12 @@ async function runOne(c) {
   return { pass: true, stage: "turn2", reason: "accepted (empty_ok)" };
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-async function main() {
-  console.log(`\nbench-multiturn: model=${MODEL} host=${HOST} cases=${CASES.length}\n`);
+// Case identity for failure diff. Prompts are unique → `cat::prompt` is stable.
+const caseId = c => `${c.cat}::${c.prompt}`;
+
+async function runCases() {
   const byCat = new Map();
-  const fails = [];
+  const failedPrompts = [];
   const t0 = performance.now();
   for (const c of CASES) {
     let r;
@@ -189,28 +200,119 @@ async function main() {
     row.total++;
     if (r.pass) row.pass++;
     byCat.set(c.cat, row);
-    if (!r.pass) fails.push({ c, r });
+    if (!r.pass) failedPrompts.push(caseId(c));
     if (VERBOSE) console.log(`${r.pass ? "✔" : "✘"} [${c.cat}] ${c.prompt.slice(0, 60)}  — ${r.reason}`);
   }
-  const dur = ((performance.now() - t0) / 1000).toFixed(1);
-
-  console.log("");
-  console.log("category    | total | pass | pass%");
-  console.log("-".repeat(40));
-  for (const [cat, r] of byCat) {
-    console.log(`${cat.padEnd(12)}| ${String(r.total).padStart(5)} | ${String(r.pass).padStart(4)} | ${(100 * r.pass / r.total).toFixed(0).padStart(4)}%`);
-  }
+  const dur = (performance.now() - t0) / 1000;
   const total = CASES.length;
   const pass = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
-  console.log("-".repeat(40));
-  console.log(`${"OVERALL".padEnd(12)}| ${String(total).padStart(5)} | ${String(pass).padStart(4)} | ${(100 * pass / total).toFixed(0).padStart(4)}%`);
-  console.log(`\nwall: ${dur}s`);
+  return {
+    savedAt: new Date().toISOString(),
+    model: MODEL,
+    total, pass,
+    byCat: Object.fromEntries(byCat),
+    failedPrompts,
+    durationSec: dur,
+  };
+}
 
-  if (fails.length) {
-    console.log("\nfailures:");
-    for (const f of fails) {
-      console.log(`  [${f.c.cat}] ${f.c.prompt}\n    → ${f.r.reason}`);
+// ── Reporting ────────────────────────────────────────────────────────────────
+function fmtPct(n)   { return `${n.toFixed(0)}%`; }
+function fmtDelta(d) {
+  if (d === null || d === undefined || !Number.isFinite(d)) return "—";
+  const sign = d >= 0 ? "+" : "";
+  const tag  = d < 0 ? " ⚠" : "";
+  return `${sign}${d.toFixed(0)}pp${tag}`;
+}
+
+function printReport(current, base) {
+  const hasBase = !!base;
+  const cols = hasBase
+    ? ["category", "total", "pass", "pass%", "Δ pass%"]
+    : ["category", "total", "pass", "pass%"];
+  const widths = [12, 5, 4, 5, 8].slice(0, cols.length);
+  const pad = (s, w, right = true) => right ? String(s).padStart(w) : String(s).padEnd(w);
+
+  console.log("");
+  console.log(cols.map((c, i) => i === 0 ? pad(c, widths[i], false) : pad(c, widths[i])).join(" | "));
+  console.log("-".repeat(widths.reduce((a, w) => a + w + 3, 0)));
+
+  const rowFor = (label, r, bRow) => {
+    const passPct = 100 * r.pass / r.total;
+    const bP = bRow ? 100 * bRow.pass / bRow.total : null;
+    const dP = bP !== null ? passPct - bP : null;
+    const base = [pad(label, widths[0], false), pad(r.total, widths[1]), pad(r.pass, widths[2]), pad(fmtPct(passPct), widths[3])];
+    if (hasBase) return [...base, pad(fmtDelta(dP), widths[4])].join(" | ");
+    return base.join(" | ");
+  };
+
+  for (const [cat, r] of Object.entries(current.byCat)) {
+    console.log(rowFor(cat, r, base?.byCat?.[cat]));
+  }
+  console.log("-".repeat(widths.reduce((a, w) => a + w + 3, 0)));
+  const overallBase = base ? { total: base.total, pass: base.pass } : null;
+  console.log(rowFor("OVERALL", { total: current.total, pass: current.pass }, overallBase));
+  console.log(`\nwall: ${current.durationSec.toFixed(1)}s`);
+
+  if (hasBase) {
+    const baseSet = new Set(base.failedPrompts ?? []);
+    const curSet  = new Set(current.failedPrompts);
+    const newFails  = [...curSet].filter(f => !baseSet.has(f));
+    const newPasses = [...baseSet].filter(f => !curSet.has(f));
+    if (newFails.length) {
+      console.log("\nnewly failed vs baseline:");
+      for (const f of newFails) {
+        const [cat, prompt] = f.split("::");
+        console.log(`  [${cat}] ${prompt}`);
+      }
     }
+    if (newPasses.length) {
+      console.log("\nnewly passed vs baseline:");
+      for (const f of newPasses) {
+        const [cat, prompt] = f.split("::");
+        console.log(`  [${cat}] ${prompt}`);
+      }
+    }
+    const overallDelta = (100 * current.pass / current.total) - (100 * base.pass / base.total);
+    if (overallDelta < 0)      console.log(`\n⚠ overall pass% regressed ${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else if (overallDelta > 0) console.log(`\n✓ overall pass% improved +${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else                       console.log(`\n✓ overall pass% unchanged vs baseline (saved ${base.savedAt})`);
+  } else if (current.failedPrompts.length) {
+    console.log("\nfailures:");
+    for (const f of current.failedPrompts) {
+      const [cat, prompt] = f.split("::");
+      console.log(`  [${cat}] ${prompt}`);
+    }
+  }
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  console.log(`\nbench-multiturn: model=${MODEL} host=${HOST} cases=${CASES.length}\n`);
+
+  const existing = read(OUT);
+  let mode = MODE;
+  if (mode === "smart") {
+    if (!existing?.multiturn) {
+      mode = "save";
+      console.log(`(no multiturn section at ${OUT} — saving one now)`);
+    } else if (existing.multiturn.model !== MODEL) {
+      mode = "run";
+      console.log(`⚠ multiturn baseline is for model ${existing.multiturn.model}, running ${MODEL} — raw numbers, no compare`);
+    } else {
+      mode = "compare";
+    }
+  } else if (mode === "compare" && !existing?.multiturn) {
+    console.error(`no multiturn section at ${OUT} — run with --save first`);
+    process.exit(1);
+  }
+
+  const current = await runCases();
+  printReport(current, mode === "compare" ? existing.multiturn : null);
+
+  if (mode === "save") {
+    writeMerge(OUT, { multiturn: current });
+    console.log(`\nmultiturn baseline saved → ${OUT}`);
   }
 }
 

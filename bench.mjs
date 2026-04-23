@@ -26,11 +26,12 @@
  * Back-compat: `bench.mjs save|compare|run` still works, routes to `perf`.
  */
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { read as readBaselineFile, writeMerge } from "./bench-baseline.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -670,15 +671,7 @@ function serverEnvSummary(env) {
   return Object.entries(e).map(([k, v]) => `${k}=${v}`).join(" ");
 }
 
-function readBaseline(path) {
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, "utf-8"));
-  } catch (e) {
-    console.error(`baseline at ${path} is unreadable (${e.message}) — delete it or run './bench baseline clear'`);
-    process.exit(1);
-  }
-}
+const readBaseline = readBaselineFile;
 
 // Pre-commit check before we persist a baseline. Catches NaN/Infinity from
 // malformed Ollama responses (eval_duration=0 yields Infinity in genTps) and
@@ -766,11 +759,14 @@ async function runPerf(mode) {
       for (const e of errs) console.error(`  ${e}`);
       process.exit(1);
     }
-    // Atomic write: tmp + rename so a Ctrl-C or crash mid-write can't corrupt
-    // the existing baseline. rename(2) is atomic within a filesystem.
-    const tmp = OUT + ".tmp";
-    writeFileSync(tmp, JSON.stringify(current, null, 2));
-    renameSync(tmp, OUT);
+    // writeMerge preserves toolcall/multiturn sections if present — perf save
+    // only owns env + singleStream + coldStart + concurrent.
+    writeMerge(OUT, {
+      env: current.env,
+      singleStream: current.singleStream,
+      coldStart: current.coldStart,
+      concurrent: current.concurrent,
+    });
     console.log(`\nbaseline saved → ${OUT}`);
     base = null; // don't diff a just-saved baseline against itself
   }
@@ -849,6 +845,15 @@ function cmdBaseline(sub) {
   console.log(`  ollama:  ${b.env?.ollamaVersion ?? "?"}`);
   if (b.singleStream) {
     console.log(`  single-stream gen t/s: ${b.singleStream.map(r => `${r.ctx}=${r.genTps.toFixed(1)}`).join("  ")}`);
+  }
+  if (b.toolcall) {
+    const pp = (100 * b.toolcall.pass / b.toolcall.total).toFixed(0);
+    const sp = (100 * b.toolcall.schema / b.toolcall.total).toFixed(0);
+    console.log(`  toolcall:  ${b.toolcall.pass}/${b.toolcall.total} pass (${pp}%)  schema ${sp}%  model=${b.toolcall.model}`);
+  }
+  if (b.multiturn) {
+    const pp = (100 * b.multiturn.pass / b.multiturn.total).toFixed(0);
+    console.log(`  multiturn: ${b.multiturn.pass}/${b.multiturn.total} pass (${pp}%)  model=${b.multiturn.model}`);
   }
 }
 

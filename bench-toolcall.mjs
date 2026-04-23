@@ -6,6 +6,11 @@
  *
  * Usage:
  *   node bench-toolcall.mjs [--model gemma4:26b] [--host http://localhost:11434]
+ *                           [--out ./baseline.json] [--save|--compare]
+ *
+ * Default (no --save/--compare) is smart mode: saves if no toolcall section
+ * in the baseline, compares otherwise. `--save` forces overwrite; `--compare`
+ * errors if the section is missing.
  *
  * Scoring per case:
  *   - tool_call_expected + got_call + right_name + args_superset(expected) → PASS
@@ -18,12 +23,18 @@
  */
 
 import { TOOLS } from "./bench-tools.mjs";
+import { read, writeMerge } from "./bench-baseline.mjs";
 
 const args = process.argv.slice(2);
-const arg = (n, fb) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : fb; };
-const MODEL = arg("--model", "gemma4:26b");
-const HOST  = arg("--host",  "http://ollama:11434");
+// lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
+const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
+const MODEL   = arg("--model", "gemma4:26b");
+const HOST    = arg("--host",  "http://ollama:11434");
+const OUT     = arg("--out",   "./baseline.json");
 const VERBOSE = args.includes("-v");
+const MODE    = args.includes("--save")    ? "save"
+              : args.includes("--compare") ? "compare"
+              : "smart";
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 // each case: { cat, prompt, expect: { call: bool, name?, args?: {required keys w/ expected value semantics} } }
@@ -118,10 +129,13 @@ function scoreCase(c, out) {
   return { pass: true, schema: true, reason: "ok" };
 }
 
-async function main() {
-  console.log(`\nbench: model=${MODEL} host=${HOST} cases=${CASES.length}\n`);
+// Case identity for baseline failure diff. Prompts are unique across CASES so
+// `cat::prompt` is stable across runs and human-readable when we print diffs.
+const caseId = c => `${c.cat}::${c.prompt}`;
+
+async function runCases() {
   const byCat = new Map();
-  const fails = [];
+  const failedPrompts = [];
   const t0 = performance.now();
   for (const c of CASES) {
     let out, scored;
@@ -136,29 +150,124 @@ async function main() {
     if (scored.pass) row.pass++;
     if (scored.schema) row.schema++;
     byCat.set(c.cat, row);
-    if (!scored.pass) fails.push({ c, scored, out });
+    if (!scored.pass) failedPrompts.push(caseId(c));
     if (VERBOSE) console.log(`${scored.pass ? "✔" : "✘"} [${c.cat}] ${c.prompt.slice(0,60)}  — ${scored.reason}`);
   }
-  const dur = ((performance.now() - t0) / 1000).toFixed(1);
+  const dur = (performance.now() - t0) / 1000;
+  const total = CASES.length;
+  const pass   = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
+  const schema = [...byCat.values()].reduce((a, r) => a + r.schema, 0);
+  return {
+    savedAt: new Date().toISOString(),
+    model: MODEL,
+    total, pass, schema,
+    byCat: Object.fromEntries(byCat),
+    failedPrompts,
+    durationSec: dur,
+  };
+}
+
+// ── Reporting ────────────────────────────────────────────────────────────────
+function fmtPct(n)   { return `${n.toFixed(0)}%`; }
+function fmtDelta(d) {
+  if (d === null || d === undefined || !Number.isFinite(d)) return "—";
+  const sign = d >= 0 ? "+" : "";
+  const tag  = d < 0 ? " ⚠" : "";
+  return `${sign}${d.toFixed(0)}pp${tag}`;
+}
+
+function printReport(current, base) {
+  const byCatBase = base?.byCat ?? null;
+  const hasBase = !!base;
+  const cols = hasBase
+    ? ["category", "total", "pass", "pass%", "Δ pass%", "schema%", "Δ schema%"]
+    : ["category", "total", "pass", "pass%", "schema%"];
+  const widths = [12, 5, 4, 5, 8, 7, 9].slice(0, cols.length);
+  const pad = (s, w, right = true) => right ? String(s).padStart(w) : String(s).padEnd(w);
 
   console.log("");
-  console.log("category    | total | pass | pass% | schema%");
-  console.log("-".repeat(50));
-  for (const [cat, r] of byCat) {
-    console.log(`${cat.padEnd(12)}| ${String(r.total).padStart(5)} | ${String(r.pass).padStart(4)} | ${(100 * r.pass / r.total).toFixed(0).padStart(4)}% | ${(100 * r.schema / r.total).toFixed(0).padStart(6)}%`);
-  }
-  const total = CASES.length;
-  const pass = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
-  const schemaPass = [...byCat.values()].reduce((a, r) => a + r.schema, 0);
-  console.log("-".repeat(50));
-  console.log(`${"OVERALL".padEnd(12)}| ${String(total).padStart(5)} | ${String(pass).padStart(4)} | ${(100 * pass / total).toFixed(0).padStart(4)}% | ${(100 * schemaPass / total).toFixed(0).padStart(6)}%`);
-  console.log(`\nwall: ${dur}s`);
+  console.log(cols.map((c, i) => i === 0 ? pad(c, widths[i], false) : pad(c, widths[i])).join(" | "));
+  console.log("-".repeat(widths.reduce((a, w) => a + w + 3, 0)));
 
-  if (fails.length) {
-    console.log("\nfailures:");
-    for (const f of fails) {
-      console.log(`  [${f.c.cat}] ${f.c.prompt}\n    → ${f.scored.reason}`);
+  const rowFor = (label, r, bRow) => {
+    const passPct = 100 * r.pass / r.total;
+    const schPct  = 100 * r.schema / r.total;
+    const bP = bRow ? 100 * bRow.pass / bRow.total : null;
+    const bS = bRow ? 100 * bRow.schema / bRow.total : null;
+    const dP = bP !== null ? passPct - bP : null;
+    const dS = bS !== null ? schPct - bS : null;
+    const base = [pad(label, widths[0], false), pad(r.total, widths[1]), pad(r.pass, widths[2]), pad(fmtPct(passPct), widths[3])];
+    if (hasBase) return [...base, pad(fmtDelta(dP), widths[4]), pad(fmtPct(schPct), widths[5]), pad(fmtDelta(dS), widths[6])].join(" | ");
+    return [...base, pad(fmtPct(schPct), widths[4])].join(" | ");
+  };
+
+  for (const [cat, r] of Object.entries(current.byCat)) {
+    console.log(rowFor(cat, r, byCatBase?.[cat]));
+  }
+  console.log("-".repeat(widths.reduce((a, w) => a + w + 3, 0)));
+  const overallBase = base ? { total: base.total, pass: base.pass, schema: base.schema } : null;
+  console.log(rowFor("OVERALL", { total: current.total, pass: current.pass, schema: current.schema }, overallBase));
+  console.log(`\nwall: ${current.durationSec.toFixed(1)}s`);
+
+  if (hasBase) {
+    const baseSet = new Set(base.failedPrompts ?? []);
+    const curSet  = new Set(current.failedPrompts);
+    const newFails  = [...curSet].filter(f => !baseSet.has(f));
+    const newPasses = [...baseSet].filter(f => !curSet.has(f));
+    if (newFails.length) {
+      console.log("\nnewly failed vs baseline:");
+      for (const f of newFails) {
+        const [cat, prompt] = f.split("::");
+        console.log(`  [${cat}] ${prompt}`);
+      }
     }
+    if (newPasses.length) {
+      console.log("\nnewly passed vs baseline:");
+      for (const f of newPasses) {
+        const [cat, prompt] = f.split("::");
+        console.log(`  [${cat}] ${prompt}`);
+      }
+    }
+    const overallDelta = (100 * current.pass / current.total) - (100 * base.pass / base.total);
+    if (overallDelta < 0)      console.log(`\n⚠ overall pass% regressed ${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else if (overallDelta > 0) console.log(`\n✓ overall pass% improved +${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else                       console.log(`\n✓ overall pass% unchanged vs baseline (saved ${base.savedAt})`);
+  } else if (current.failedPrompts.length) {
+    console.log("\nfailures:");
+    for (const f of current.failedPrompts) {
+      const [cat, prompt] = f.split("::");
+      console.log(`  [${cat}] ${prompt}`);
+    }
+  }
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  console.log(`\nbench-toolcall: model=${MODEL} host=${HOST} cases=${CASES.length}\n`);
+
+  const existing = read(OUT);
+  let mode = MODE;
+  if (mode === "smart") {
+    if (!existing?.toolcall) {
+      mode = "save";
+      console.log(`(no toolcall section at ${OUT} — saving one now)`);
+    } else if (existing.toolcall.model !== MODEL) {
+      mode = "run";
+      console.log(`⚠ toolcall baseline is for model ${existing.toolcall.model}, running ${MODEL} — raw numbers, no compare`);
+    } else {
+      mode = "compare";
+    }
+  } else if (mode === "compare" && !existing?.toolcall) {
+    console.error(`no toolcall section at ${OUT} — run with --save first`);
+    process.exit(1);
+  }
+
+  const current = await runCases();
+  printReport(current, mode === "compare" ? existing.toolcall : null);
+
+  if (mode === "save") {
+    writeMerge(OUT, { toolcall: current });
+    console.log(`\ntoolcall baseline saved → ${OUT}`);
   }
 }
 
