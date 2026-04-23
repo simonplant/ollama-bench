@@ -26,7 +26,7 @@
  * Back-compat: `bench.mjs save|compare|run` still works, routes to `perf`.
  */
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -124,6 +124,23 @@ function mkPrompt(ctxIdx, runIdx) {
 }
 
 // ── Ollama API ───────────────────────────────────────────────────────────────
+// Abort-signal helper. Callers must invoke cancel() in a finally block.
+function withTimeout(ms) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  return { signal: ac.signal, cancel: () => clearTimeout(timer) };
+}
+
+// Per-call budget. Base covers HTTP + model load (cold-start reloads a 26B can
+// take 30-60s on NVMe); per-token ceiling of 600ms covers CPU-fallback and
+// heavily contended hardware (a happy GPU runs 10-30x faster). Env override
+// lets the user bump it without an edit when running on weaker hardware.
+function timeoutMsFor(numPredict) {
+  const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(override) && override > 0) return override;
+  return 120_000 + numPredict * 600;
+}
+
 async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
   const body = {
     model: MODEL,
@@ -132,11 +149,22 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
     options: { num_predict: numPredict, temperature: 0, seed: 42 },
   };
   if (keepAlive !== undefined) body.keep_alive = keepAlive;
-  const res = await fetch(`${HOST}/api/generate`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const timeoutMs = timeoutMsFor(numPredict);
+  const t = withTimeout(timeoutMs);
+  let res;
+  try {
+    res = await fetch(`${HOST}/api/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: t.signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`Ollama /api/generate timed out after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    throw e;
+  } finally {
+    t.cancel();
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
   const j = await res.json();
   return {
@@ -266,32 +294,54 @@ function tryExec(cmd) {
   catch { return null; }
 }
 
+// Wrapper around fetch with a 10s timeout. Metadata calls that hang would stall
+// startup; null-on-failure matches the original silent-fallback behavior.
+async function fetchMeta(url, opts = {}) {
+  const t = withTimeout(10_000);
+  try {
+    const r = await fetch(url, { ...opts, signal: t.signal });
+    return r.ok ? r : null;
+  } catch { return null; }
+  finally { t.cancel(); }
+}
+
+// Accept quant/variant suffixes: user asks for `gemma4:26b`, Ollama may report
+// `gemma4:26b-q4_K_M`. Exact match wins; otherwise match if either side is a
+// `-`-separated prefix of the other (standard Ollama tag convention).
+function matchModel(models, wanted) {
+  const names = m => [m.name, m.model].filter(Boolean);
+  const exact = models.find(m => names(m).includes(wanted));
+  if (exact) return exact;
+  return models.find(m => names(m).some(n =>
+    n.startsWith(wanted + "-") || wanted.startsWith(n + "-")
+  )) ?? null;
+}
+
 async function env() {
   // Query Ollama's own API for its view. When run inside a container the host
   // `docker` / `nvidia-smi` won't be reachable, so use the API where possible.
   let ollamaVersion = null;
-  try {
-    const r = await fetch(`${HOST}/api/version`);
-    if (r.ok) ollamaVersion = (await r.json()).version;
-  } catch {}
+  const versionRes = await fetchMeta(`${HOST}/api/version`);
+  if (versionRes) ollamaVersion = (await versionRes.json()).version;
+
   let modelDigest = null, modelParams = null, quant = null;
-  try {
-    const r = await fetch(`${HOST}/api/show`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: MODEL }) });
-    if (r.ok) {
-      const j = await r.json();
-      modelParams = j.details?.parameter_size ?? null;
-      quant = j.details?.quantization_level ?? null;
-    }
-  } catch {}
+  const showRes = await fetchMeta(`${HOST}/api/show`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: MODEL }),
+  });
+  if (showRes) {
+    const j = await showRes.json();
+    modelParams = j.details?.parameter_size ?? null;
+    quant = j.details?.quantization_level ?? null;
+  }
   // Digest is on /api/tags, not /api/show
-  try {
-    const r = await fetch(`${HOST}/api/tags`);
-    if (r.ok) {
-      const j = await r.json();
-      const hit = (j.models ?? []).find(m => m.name === MODEL || m.model === MODEL);
-      modelDigest = hit?.digest ?? null;
-    }
-  } catch {}
+  const tagsRes = await fetchMeta(`${HOST}/api/tags`);
+  if (tagsRes) {
+    const j = await tagsRes.json();
+    const hit = matchModel(j.models ?? [], MODEL);
+    modelDigest = hit?.digest ?? null;
+  }
 
   // GPU state — prefer host-injected CSV (Docker-sibling flow: sibling rarely
   // has nvidia-smi, so the wrapper runs it on the host and forwards results).
@@ -320,7 +370,9 @@ async function env() {
       const arr = JSON.parse(dockerEnv);
       const rel = arr.filter(kv => /^OLLAMA_/.test(kv));
       ollamaServerEnv = Object.fromEntries(rel.map(kv => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)]; }));
-    } catch {}
+    } catch (e) {
+      console.warn(`warn: failed to parse Ollama server env JSON (${e.message}) — env diff will miss OLLAMA_* vars`);
+    }
   }
   if (!ollamaServerEnv) {
     const relevant = ["OLLAMA_NUM_PARALLEL", "OLLAMA_MAX_LOADED_MODELS", "OLLAMA_KEEP_ALIVE", "OLLAMA_FLASH_ATTENTION", "OLLAMA_KV_CACHE_TYPE"];
@@ -628,6 +680,42 @@ function readBaseline(path) {
   }
 }
 
+// Pre-commit check before we persist a baseline. Catches NaN/Infinity from
+// malformed Ollama responses (eval_duration=0 yields Infinity in genTps) and
+// structural gaps from a scenario that errored out silently. Atomic write
+// without this check would faithfully persist garbage, which is worse than a
+// non-atomic write that might have left the old good baseline in place.
+function validateBaselineShape(b) {
+  const errs = [];
+  const finite = x => typeof x === "number" && Number.isFinite(x);
+  if (!b?.env?.model)     errs.push("env.model missing");
+  if (!b?.env?.machineId) errs.push("env.machineId missing");
+
+  const ss = b?.singleStream;
+  if (!Array.isArray(ss) || ss.length === 0) errs.push("singleStream empty");
+  else for (const r of ss) {
+    if (!r?.ctx) errs.push("singleStream row missing ctx");
+    for (const k of ["promptTps", "genTps", "totalMs"]) {
+      if (!finite(r?.[k])) errs.push(`singleStream[${r?.ctx}].${k} not finite (${r?.[k]})`);
+    }
+  }
+
+  const cs = b?.coldStart;
+  if (!cs) errs.push("coldStart missing");
+  else for (const k of ["loadMs", "firstPromptWallMs", "genTps"]) {
+    if (!finite(cs[k])) errs.push(`coldStart.${k} not finite (${cs[k]})`);
+  }
+
+  const co = b?.concurrent;
+  if (!Array.isArray(co) || co.length === 0) errs.push("concurrent empty");
+  else for (const r of co) {
+    for (const k of ["e2eGenTps", "decodeGenTps", "perStreamGenTps"]) {
+      if (!finite(r?.[k])) errs.push(`concurrent[n=${r?.parallel}].${k} not finite (${r?.[k]})`);
+    }
+  }
+  return errs;
+}
+
 // ── Perf runner ──────────────────────────────────────────────────────────────
 // mode: "save" | "compare" | "run" | "smart"
 //   smart → compare if baseline exists (same machine), save if not, run otherwise.
@@ -672,7 +760,17 @@ async function runPerf(mode) {
   const current = { env: envSnap, singleStream, coldStart, concurrent };
 
   if (resolved === "save") {
-    writeFileSync(OUT, JSON.stringify(current, null, 2));
+    const errs = validateBaselineShape(current);
+    if (errs.length) {
+      console.error(`\nrefusing to save invalid baseline — existing baseline at ${OUT} preserved:`);
+      for (const e of errs) console.error(`  ${e}`);
+      process.exit(1);
+    }
+    // Atomic write: tmp + rename so a Ctrl-C or crash mid-write can't corrupt
+    // the existing baseline. rename(2) is atomic within a filesystem.
+    const tmp = OUT + ".tmp";
+    writeFileSync(tmp, JSON.stringify(current, null, 2));
+    renameSync(tmp, OUT);
     console.log(`\nbaseline saved → ${OUT}`);
     base = null; // don't diff a just-saved baseline against itself
   }
