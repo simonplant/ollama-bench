@@ -23,7 +23,7 @@
  */
 
 import { TOOLS } from "./bench-tools.mjs";
-import { read, writeMerge } from "./bench-baseline.mjs";
+import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 
 const args = process.argv.slice(2);
 // lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
@@ -245,29 +245,30 @@ function printReport(current, base) {
 async function main() {
   console.log(`\nbench-toolcall: model=${MODEL} host=${HOST} cases=${CASES.length}\n`);
 
-  const existing = read(OUT);
+  // v2 baseline: toolcall is keyed under models[<MODEL>].toolcall, so the
+  // model-mismatch case from v1 (one slot for one model) doesn't apply —
+  // each model has its own slice. If MODEL has never been benched here,
+  // smart mode saves; otherwise compares.
+  const existingToolcall = getModelSection(OUT, MODEL, "toolcall");
   let mode = MODE;
   if (mode === "smart") {
-    if (!existing?.toolcall) {
+    if (!existingToolcall) {
       mode = "save";
-      console.log(`(no toolcall section at ${OUT} — saving one now)`);
-    } else if (existing.toolcall.model !== MODEL) {
-      mode = "run";
-      console.log(`⚠ toolcall baseline is for model ${existing.toolcall.model}, running ${MODEL} — raw numbers, no compare`);
+      console.log(`(no toolcall entry for ${MODEL} at ${OUT} — saving one now)`);
     } else {
       mode = "compare";
     }
-  } else if (mode === "compare" && !existing?.toolcall) {
-    console.error(`no toolcall section at ${OUT} — run with --save first`);
+  } else if (mode === "compare" && !existingToolcall) {
+    console.error(`no toolcall entry for ${MODEL} at ${OUT} — run with --save first`);
     process.exit(1);
   }
 
   const current = await runCases();
-  printReport(current, mode === "compare" ? existing.toolcall : null);
+  printReport(current, mode === "compare" ? existingToolcall : null);
 
   if (mode === "save") {
-    writeMerge(OUT, { toolcall: current });
-    console.log(`\ntoolcall baseline saved → ${OUT}`);
+    writeModelSection(OUT, MODEL, "toolcall", current);
+    console.log(`\ntoolcall entry saved for ${MODEL} → ${OUT}`);
   }
 }
 

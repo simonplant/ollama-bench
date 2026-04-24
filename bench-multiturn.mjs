@@ -38,7 +38,7 @@
  */
 
 import { TOOLS } from "./bench-tools.mjs";
-import { read, writeMerge } from "./bench-baseline.mjs";
+import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 
 const args = process.argv.slice(2);
 // lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
@@ -290,29 +290,28 @@ function printReport(current, base) {
 async function main() {
   console.log(`\nbench-multiturn: model=${MODEL} host=${HOST} cases=${CASES.length}\n`);
 
-  const existing = read(OUT);
+  // v2 baseline: multiturn is keyed under models[<MODEL>].multiturn. Each
+  // model has its own slice; no model-mismatch case.
+  const existingMultiturn = getModelSection(OUT, MODEL, "multiturn");
   let mode = MODE;
   if (mode === "smart") {
-    if (!existing?.multiturn) {
+    if (!existingMultiturn) {
       mode = "save";
-      console.log(`(no multiturn section at ${OUT} — saving one now)`);
-    } else if (existing.multiturn.model !== MODEL) {
-      mode = "run";
-      console.log(`⚠ multiturn baseline is for model ${existing.multiturn.model}, running ${MODEL} — raw numbers, no compare`);
+      console.log(`(no multiturn entry for ${MODEL} at ${OUT} — saving one now)`);
     } else {
       mode = "compare";
     }
-  } else if (mode === "compare" && !existing?.multiturn) {
-    console.error(`no multiturn section at ${OUT} — run with --save first`);
+  } else if (mode === "compare" && !existingMultiturn) {
+    console.error(`no multiturn entry for ${MODEL} at ${OUT} — run with --save first`);
     process.exit(1);
   }
 
   const current = await runCases();
-  printReport(current, mode === "compare" ? existing.multiturn : null);
+  printReport(current, mode === "compare" ? existingMultiturn : null);
 
   if (mode === "save") {
-    writeMerge(OUT, { multiturn: current });
-    console.log(`\nmultiturn baseline saved → ${OUT}`);
+    writeModelSection(OUT, MODEL, "multiturn", current);
+    console.log(`\nmultiturn entry saved for ${MODEL} → ${OUT}`);
   }
 }
 

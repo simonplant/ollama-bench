@@ -31,7 +31,15 @@ import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { read as readBaselineFile, writeMerge } from "./bench-baseline.mjs";
+import {
+  read as readBaselineFile,
+  getModelSection,
+  getMachine,
+  listModels,
+  writeModelSection,
+  removeModel,
+  clearAll,
+} from "./bench-baseline.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -671,7 +679,12 @@ function serverEnvSummary(env) {
   return Object.entries(e).map(([k, v]) => `${k}=${v}`).join(" ");
 }
 
-const readBaseline = readBaselineFile;
+// Convenience: read the v2-shaped perf slice for the current MODEL. Returns
+// null when this machine has never benched that model. Schema migration
+// (v1 → v2) happens transparently inside readBaselineFile().
+function readPerfBaseline() {
+  return getModelSection(OUT, MODEL, "perf");
+}
 
 // Pre-commit check before we persist a baseline. Catches NaN/Infinity from
 // malformed Ollama responses (eval_duration=0 yields Infinity in genTps) and
@@ -711,20 +724,23 @@ function validateBaselineShape(b) {
 
 // ── Perf runner ──────────────────────────────────────────────────────────────
 // mode: "save" | "compare" | "run" | "smart"
-//   smart → compare if baseline exists (same machine), save if not, run otherwise.
+//   smart → compare if this MODEL has a perf entry (same machine); save if
+//   not (this machine has never benched this model); run if a different
+//   machine produced the entry (unlikely with per-machine baselines but
+//   possible if the file was copied around).
 async function runPerf(mode) {
   const envSnap = await env();
 
-  // Resolve smart mode before announcing, so the header says what we're doing.
   let resolved = mode;
-  let base = readBaseline(OUT);
+  let perfBase = readPerfBaseline();
+  const machine = getMachine(OUT);
   if (mode === "smart") {
-    if (!base) {
+    if (!perfBase) {
       resolved = "save";
-      console.log(`(no baseline at ${OUT} — saving one now; re-run after any change to see regressions)`);
-    } else if (base.env?.machineId && envSnap.machineId && base.env.machineId !== envSnap.machineId) {
+      console.log(`(no perf entry for ${MODEL} at ${OUT} — saving one now; re-run after any change to see regressions)`);
+    } else if (machine?.machineId && envSnap.machineId && machine.machineId !== envSnap.machineId) {
       resolved = "run";
-      console.log(`⚠ baseline is from a different machine (${base.env.machineId} vs ${envSnap.machineId}) — showing raw numbers, no compare.`);
+      console.log(`⚠ baseline machine (${machine.machineId}) ≠ current (${envSnap.machineId}) — showing raw numbers, no compare.`);
     } else {
       resolved = "compare";
     }
@@ -755,44 +771,46 @@ async function runPerf(mode) {
   if (resolved === "save") {
     const errs = validateBaselineShape(current);
     if (errs.length) {
-      console.error(`\nrefusing to save invalid baseline — existing baseline at ${OUT} preserved:`);
+      console.error(`\nrefusing to save invalid perf entry for ${MODEL} — existing entry at ${OUT} preserved:`);
       for (const e of errs) console.error(`  ${e}`);
       process.exit(1);
     }
-    // writeMerge preserves toolcall/multiturn sections if present — perf save
-    // only owns env + singleStream + coldStart + concurrent.
-    writeMerge(OUT, {
+    // Per-model write: only this MODEL's perf slice is touched. Other models'
+    // entries and this model's toolcall/multiturn sections are preserved.
+    // Machine slice is refreshed so the league always reflects the latest box.
+    writeModelSection(OUT, MODEL, "perf", {
       env: current.env,
       singleStream: current.singleStream,
       coldStart: current.coldStart,
       concurrent: current.concurrent,
+    }, {
+      machineId:     envSnap.machineId,
+      hostMachineId: envSnap.hostMachineId,
+      hostname:      envSnap.hostname,
+      kernel:        envSnap.kernel,
+      gpu:           envSnap.gpu,
     });
-    console.log(`\nbaseline saved → ${OUT}`);
-    base = null; // don't diff a just-saved baseline against itself
+    console.log(`\nperf entry saved for ${MODEL} → ${OUT}`);
+    perfBase = null; // don't diff a just-saved entry against itself
   }
 
   if (resolved === "compare") {
-    if (!base) {
-      console.log(`\nno baseline at ${OUT} — run './bench perf save' first`);
+    if (!perfBase) {
+      console.log(`\nno perf entry for ${MODEL} at ${OUT} — run './bench perf save' first`);
     } else {
-      if (base.env?.machineId && envSnap.machineId && base.env.machineId !== envSnap.machineId) {
-        console.log(`\n⚠ machine mismatch: baseline from ${base.env.machineId} (${base.env.hostname ?? "?"} · ${base.env.gpu?.[0]?.name ?? "no GPU"})`);
-        console.log(`                  current  from ${envSnap.machineId} (${envSnap.hostname ?? "?"} · ${envSnap.gpu?.[0]?.name ?? "no GPU"})`);
-        console.log(`  Deltas below will be dominated by hardware/driver differences, not your change.`);
-      }
-      envDiff(envSnap, base);
+      envDiff(envSnap, perfBase);
     }
   } else {
-    base = null;
+    perfBase = null;
   }
 
   printHeadline(current, envSnap);
-  printSingleStream(singleStream, base);
-  printColdStart(coldStart, base);
-  printConcurrent(concurrent, base, envSnap);
+  printSingleStream(singleStream, perfBase);
+  printColdStart(coldStart, perfBase);
+  printConcurrent(concurrent, perfBase, envSnap);
 
-  if (resolved === "compare" && base) {
-    const regs = collectRegressions(current, base);
+  if (resolved === "compare" && perfBase) {
+    const regs = collectRegressions(current, perfBase);
     if (regs.length === 0) {
       console.log("\n" + col.green("✓ no regressions"));
     } else {
@@ -801,17 +819,18 @@ async function runPerf(mode) {
       const tail = overflow > 0 ? `, …and ${overflow} more` : "";
       console.log("\n" + col.red(`⚠ ${regs.length} cell${regs.length === 1 ? "" : "s"} regressed`) + ": " + shown.join(", ") + tail);
     }
-    const hasCv = base.singleStream?.some(r => r.cv);
+    const hasCv = perfBase.singleStream?.some(r => r.cv);
     console.log(col.dim(`regression threshold: ${REG_PCT}% ${hasCv ? "or 2× per-cell noise (whichever is higher)" : ""} → flags ⚠`));
   }
 }
 
 // ── Subcommand dispatch ──────────────────────────────────────────────────────
-function spawnSibling(script) {
+function spawnSibling(script, extraArgs = []) {
   // Forward all flags+values; drop the first positional (the subcommand).
   // Using PARSED avoids the earlier bug where the first flag-value entry
-  // could be mistaken for the subcommand.
-  const forwarded = [...PARSED.flags, ...PARSED.positional.slice(1)];
+  // could be mistaken for the subcommand. extraArgs are appended last so
+  // rank can force --save without the user accidentally negating it.
+  const forwarded = [...PARSED.flags, ...PARSED.positional.slice(1), ...extraArgs];
   return new Promise((resolve, reject) => {
     const p = spawn(process.execPath, [join(SCRIPT_DIR, script), ...forwarded], { stdio: "inherit" });
     p.on("exit", code => code === 0 ? resolve() : reject(new Error(`${script} exited ${code}`)));
@@ -827,53 +846,170 @@ async function runAll() {
   await spawnSibling("bench-multiturn.mjs");
 }
 
-function cmdBaseline(sub) {
+// rank — bench MODEL across all three probes and (re)write its slice in the
+// league. Distinct from `all` which keeps smart compare semantics; rank is
+// the explicit "add or refresh this model in the league" verb.
+async function runRank() {
+  console.log(`=== rank ${MODEL} (perf) ===`);
+  await runPerf("save");
+  console.log(`\n=== rank ${MODEL} (toolcall) ===`);
+  await spawnSibling("bench-toolcall.mjs", ["--save"]);
+  console.log(`\n=== rank ${MODEL} (multiturn) ===`);
+  await spawnSibling("bench-multiturn.mjs", ["--save"]);
+  console.log(`\n${col.green("✓")} ${MODEL} added to league. Run './bench league' to see the table.`);
+}
+
+// ── League ──────────────────────────────────────────────────────────────────
+const STALE_DAYS = 30;
+
+function fmtAge(savedAt) {
+  if (!savedAt) return col.dim("—");
+  const ms = Date.now() - new Date(savedAt).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return col.dim("—");
+  const days = Math.floor(ms / (24 * 3600 * 1000));
+  const text = days === 0 ? "today" : `${days}d`;
+  return days > STALE_DAYS ? col.yellow(text + " ⚠") : text;
+}
+
+function leagueRowFor(entry) {
+  const ss = entry.perf?.singleStream ?? [];
+  const short = ss.find(r => r.ctx === "short") ?? ss[0] ?? null;
+  const cs = entry.perf?.coldStart ?? null;
+  const co = entry.perf?.concurrent ?? [];
+  const c4 = co.find(r => r.parallel === 4) ?? null;
+  const tc = entry.toolcall ?? null;
+  const mt = entry.multiturn ?? null;
+  return {
+    tag:           entry.tag,
+    params:        entry.perf?.env?.modelParams ?? null,
+    quant:         entry.perf?.env?.modelQuant ?? null,
+    shortGenTps:   short?.genTps ?? null,
+    ttftMs:        short?.firstTokenMs ?? null,
+    coldLoadS:     cs?.loadMs != null ? cs.loadMs / 1000 : null,
+    n4PerStream:   c4?.perStreamGenTps ?? null,
+    toolPct:       tc != null && tc.total > 0 ? (100 * tc.pass / tc.total) : null,
+    multiPct:      mt != null && mt.total > 0 ? (100 * mt.pass / mt.total) : null,
+    savedAt:       entry.savedAt,
+  };
+}
+
+function cmdLeague() {
+  const models = listModels(OUT);
+  if (models.length === 0) {
+    console.log(`no models in baseline at ${OUT} — run './bench rank --model <tag>' to add one`);
+    return;
+  }
+  const machine = getMachine(OUT);
+  const machineLine = machine
+    ? `${machine.machineId ?? "?"} (${machine.hostname ?? "?"} · ${machine.gpu?.[0]?.name ?? "no GPU"})`
+    : "(machine unknown)";
+  console.log(`\n${col.bold("League")} — machine ${machineLine}`);
+
+  // Sort by short-prompt gen t/s desc — the most "single-user chat feel"
+  // metric. Models with no perf entry sink to the bottom.
+  const rows = models.map(leagueRowFor);
+  rows.sort((a, b) => (b.shortGenTps ?? -Infinity) - (a.shortGenTps ?? -Infinity));
+
+  const cols = [
+    { label: "model",     align: "l" },
+    { label: "params",    align: "r" },
+    { label: "quant",     align: "l" },
+    { label: "gen t/s",   align: "r" },
+    { label: "ttft ms",   align: "r" },
+    { label: "cold load", align: "r" },
+    { label: "n=4 t/s",   align: "r" },
+    { label: "tool %",    align: "r" },
+    { label: "multi %",   align: "r" },
+    { label: "age",       align: "r" },
+  ];
+  const dash = col.dim("—");
+  const cells = rows.map(r => [
+    r.tag,
+    r.params != null ? r.params : dash,
+    r.quant != null  ? r.quant  : dash,
+    r.shortGenTps != null ? fmtFloat(r.shortGenTps, 1) : dash,
+    r.ttftMs      != null ? fmtInt(r.ttftMs)            : dash,
+    r.coldLoadS   != null ? fmtFloat(r.coldLoadS, 1) + "s" : dash,
+    r.n4PerStream != null ? fmtFloat(r.n4PerStream, 1)  : dash,
+    r.toolPct     != null ? `${r.toolPct.toFixed(0)}%`  : dash,
+    r.multiPct    != null ? `${r.multiPct.toFixed(0)}%` : dash,
+    fmtAge(r.savedAt),
+  ]);
+  console.log(renderTable(cols, cells));
+
+  const stale = rows.filter(r => {
+    if (!r.savedAt) return false;
+    const days = (Date.now() - new Date(r.savedAt).getTime()) / (24 * 3600 * 1000);
+    return days > STALE_DAYS;
+  });
+  if (stale.length) {
+    console.log(col.dim(`\n⚠ ${stale.length} entr${stale.length === 1 ? "y" : "ies"} older than ${STALE_DAYS} days — re-run './bench rank --model <tag>' to refresh.`));
+  }
+  console.log(col.dim(`\nsorted by short-prompt gen t/s. Add or refresh: './bench rank --model <tag>'`));
+}
+
+function cmdBaseline(sub, arg) {
   if (sub === "clear") {
+    if (arg) {
+      // `./bench baseline clear <model>` — remove just that model entry.
+      if (!existsSync(OUT)) { console.log(`no baseline at ${OUT}`); return; }
+      const removed = removeModel(OUT, arg);
+      console.log(removed ? `removed ${arg} from ${OUT}` : `${arg} not in ${OUT}`);
+      return;
+    }
     if (!existsSync(OUT)) { console.log(`no baseline at ${OUT}`); return; }
-    unlinkSync(OUT);
+    clearAll(OUT);
     console.log(`removed ${OUT}`);
     return;
   }
+
   // default: show
-  if (!existsSync(OUT)) { console.log(`no baseline at ${OUT} — run './bench perf save' to create one`); return; }
-  const b = readBaseline(OUT);
+  if (!existsSync(OUT)) { console.log(`no baseline at ${OUT} — run './bench rank --model <tag>' to add one`); return; }
+  const machine = getMachine(OUT);
+  const models = listModels(OUT);
   console.log(`baseline: ${OUT}`);
-  console.log(`  saved:   ${b.env?.timestamp ?? "?"}`);
-  console.log(`  model:   ${b.env?.model ?? "?"} (digest ${(b.env?.modelDigest ?? "").slice(0, 12)})`);
-  console.log(`  host:    ${b.env?.host ?? "?"}`);
-  console.log(`  machine: ${b.env?.machineId ?? "?"} (${b.env?.hostname ?? "?"} · ${b.env?.gpu?.[0]?.name ?? "no GPU"})`);
-  console.log(`  ollama:  ${b.env?.ollamaVersion ?? "?"}`);
-  if (b.singleStream) {
-    console.log(`  single-stream gen t/s: ${b.singleStream.map(r => `${r.ctx}=${r.genTps.toFixed(1)}`).join("  ")}`);
-  }
-  if (b.toolcall) {
-    const pp = (100 * b.toolcall.pass / b.toolcall.total).toFixed(0);
-    const sp = (100 * b.toolcall.schema / b.toolcall.total).toFixed(0);
-    console.log(`  toolcall:  ${b.toolcall.pass}/${b.toolcall.total} pass (${pp}%)  schema ${sp}%  model=${b.toolcall.model}`);
-  }
-  if (b.multiturn) {
-    const pp = (100 * b.multiturn.pass / b.multiturn.total).toFixed(0);
-    console.log(`  multiturn: ${b.multiturn.pass}/${b.multiturn.total} pass (${pp}%)  model=${b.multiturn.model}`);
+  console.log(`  schema:  v${readBaselineFile(OUT)?.schemaVersion ?? "?"}`);
+  console.log(`  machine: ${machine?.machineId ?? "?"} (${machine?.hostname ?? "?"} · ${machine?.gpu?.[0]?.name ?? "no GPU"})`);
+  console.log(`  models:  ${models.length}`);
+  for (const m of models) {
+    const tag = m.tag;
+    const ageDays = m.savedAt ? Math.floor((Date.now() - new Date(m.savedAt).getTime()) / (24 * 3600 * 1000)) : null;
+    const sections = ["perf", "toolcall", "multiturn"].filter(s => m[s]).join("+") || "(empty)";
+    console.log(`    ${tag.padEnd(28)}  [${sections}]  ${ageDays != null ? ageDays + "d ago" : "?"}`);
+    if (m.perf?.singleStream) {
+      console.log(`        gen t/s: ${m.perf.singleStream.map(r => `${r.ctx}=${(r.genTps ?? 0).toFixed(1)}`).join("  ")}`);
+    }
+    if (m.toolcall && m.toolcall.total > 0) {
+      const pp = (100 * m.toolcall.pass / m.toolcall.total).toFixed(0);
+      const sp = (100 * m.toolcall.schema / m.toolcall.total).toFixed(0);
+      console.log(`        toolcall:  ${m.toolcall.pass}/${m.toolcall.total} pass (${pp}%)  schema ${sp}%`);
+    }
+    if (m.multiturn && m.multiturn.total > 0) {
+      const pp = (100 * m.multiturn.pass / m.multiturn.total).toFixed(0);
+      console.log(`        multiturn: ${m.multiturn.pass}/${m.multiturn.total} pass (${pp}%)`);
+    }
   }
 }
 
 function printHelp() {
-  console.log(`ollama-bench — throughput regression harness + tool-call probes
+  console.log(`ollama-bench — throughput regression harness + tool-call probes + per-machine model league
 
 USAGE
   ./bench [subcommand] [flags]
 
 SUBCOMMANDS
-  (none)            Run throughput benchmark with smart baseline behavior:
-                    saves a baseline on first run, compares on every run after.
-  perf [mode]       Throughput benchmark. mode: save | compare | run | (smart).
-  toolcall          Single-turn tool-call accuracy probe (22 cases).
-  multiturn         Multi-turn tool-call probe, after fabricated tool result (14 cases).
-  doctor            Preflight audit: persistence mode, power cap, governor, KV/FA combo, etc.
-  all               Run perf (smart) + toolcall + multiturn, sequentially.
-  baseline [show]   Show baseline summary (default).
-  baseline clear    Delete baseline.json.
-  help              This message.
+  (none)                   Smart perf run for --model: save if no entry, compare otherwise.
+  perf [mode]              Throughput benchmark. mode: save | compare | run | (smart).
+  toolcall                 Single-turn tool-call accuracy probe (22 cases).
+  multiturn                Multi-turn tool-call probe, after fabricated tool result (14 cases).
+  doctor                   Preflight audit: persistence mode, power cap, governor, KV/FA combo, etc.
+  all                      perf (smart) + toolcall + multiturn for --model.
+  rank                     Bench --model end-to-end and (re)write its slice in the league.
+  league                   Print the ranked table of every model benched on this machine.
+  baseline [show]          Show baseline summary across all models (default).
+  baseline clear           Delete the whole baseline file.
+  baseline clear <model>   Remove just one model's entry.
+  help                     This message.
 
 FLAGS
   --model <tag>            default gemma4:26b
@@ -884,14 +1020,15 @@ FLAGS
   -v, --verbose            per-case output for toolcall/multiturn
 
 EXAMPLES
-  ./bench                              # smart perf run
+  ./bench                              # smart perf run for default model
+  ./bench rank --model qwen3:30b       # add qwen3:30b to the league
+  ./bench league                       # ranked comparison across all benched models
   ./bench doctor                       # audit GPU/host/Ollama config
-  ./bench perf save                    # force-save a new baseline
-  ./bench toolcall -v                  # accuracy probe, per-case output
-  ./bench all --model qwen3:30b        # compare a different model end-to-end
-  ./bench baseline clear               # start fresh
+  ./bench baseline show                # what's in the baseline, per model
+  ./bench baseline clear qwen3:30b     # drop one model from the league
 
-Back-compat: 'save'/'compare'/'run' at the top level still work, routed to 'perf'.`);
+Back-compat: 'save'/'compare'/'run' at top level still route to 'perf'.
+Schema: baseline.json is keyed by model (v2). v1 baselines auto-migrate on read.`);
 }
 
 // ── Main dispatcher ──────────────────────────────────────────────────────────
@@ -904,6 +1041,7 @@ async function main() {
 
   const cmd = positional[0] ?? "";
   const sub = positional[1] ?? "";
+  const sub2 = positional[2] ?? "";
 
   switch (cmd) {
     case "":
@@ -925,8 +1063,13 @@ async function main() {
       return spawnSibling("bench-doctor.mjs");
     case "all":
       return runAll();
+    case "rank":
+      return runRank();
+    case "league":
+      cmdLeague();
+      return;
     case "baseline":
-      return cmdBaseline(sub || "show");
+      return cmdBaseline(sub || "show", sub2);
     default:
       console.error(`unknown command: ${cmd}\n`);
       printHelp();
