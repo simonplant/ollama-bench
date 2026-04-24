@@ -1,40 +1,28 @@
 #!/usr/bin/env node
 /**
- * Multi-turn tool-call probe — the companion to bench-toolcall.mjs.
- *
- * bench-toolcall checks whether the model picks the right tool on the
- * first turn. This probe checks what happens AFTER a tool returns —
- * the failure mode that "loop-prone" local models hit:
- *
- *   - model calls a tool,
- *   - we inject a plausible tool result,
- *   - does the model synthesize a final answer, or does it call the same
- *     tool again / call unrelated tools / emit nothing?
- *
- * Each case specifies:
- *   - initial user prompt
- *   - expected first tool call (name)
- *   - what the tool "returns" (we fabricate a result)
- *   - pass rule: final message (most cases) or a specific chained call
+ * Multi-turn tool-call probe — scores what the model does AFTER a tool returns.
+ * Each case: initial user prompt → expected first tool call → fabricated tool
+ * result injected → second turn scored against a pass rule.
  *
  * Pass rules:
  *   FINAL       — second turn must be a text message, no tool_calls
  *   CHAIN:<nm>  — second turn must call tool <nm> (legitimate chain)
- *   EMPTY_OK    — any response is acceptable; we only check non-loop behavior
+ *   EMPTY_OK    — any response acceptable; only non-loop behavior is checked
  *
- * Fail signatures caught:
- *   - same tool called again with same args (the canonical loop)
- *   - same tool called with different args (arg-hallucination loop)
- *   - unrelated tool called when no tool is needed
- *   - empty/whitespace response when text was expected
- *   - more than 1 tool_call when only 1 was expected
+ * Failure signatures:
+ *   - same tool called again with identical args        (canonical loop)
+ *   - same tool called again with different args        (arg-hallucination loop)
+ *   - unrelated tool called when text was expected
+ *   - empty/whitespace content where synthesis expected
  *
  * Usage:
- *   node bench-multiturn.mjs [--model gemma4:26b] [--host http://localhost:11434]
- *                            [--out ./baseline.json] [--save|--compare] [-v]
+ *   node bench-multiturn.mjs [--model gemma4:26b] [--host http://ollama:11434]
+ *                            [--out ./baseline.json] [--save|--compare] [-v|--verbose]
  *
- * Default (no --save/--compare) is smart mode: saves if no multiturn section
- * in the baseline, compares otherwise.
+ * Default mode is smart: saves if --model has no multiturn entry in the
+ * baseline, compares otherwise. Pass% deltas flag drops past ±REG_PP (5pp).
+ *
+ * Per-call request timeout: 180s, override via OLLAMA_BENCH_TIMEOUT_MS.
  */
 
 import { TOOLS } from "./bench-tools.mjs";

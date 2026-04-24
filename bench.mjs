@@ -1,21 +1,24 @@
 #!/usr/bin/env node
 /**
- * ollama-bench — unified CLI for throughput regression + tool-call probes.
+ * ollama-bench — unified CLI: perf regression, tool-call probes, model league.
  *
- * Default (no subcommand) runs the throughput benchmark with smart baseline
- * behavior: saves a baseline on first run, compares against it on every run
- * after. That's what a user expects from "just ./bench".
+ * Default (no subcommand) runs the perf benchmark with smart baseline
+ * behavior keyed by --model: saves a slice on first run, compares on every
+ * run after.
  *
  * Subcommands:
  *   perf [save|compare|run]   Throughput benchmark. No mode → smart default.
  *   toolcall                  Single-turn tool-call accuracy probe.
  *   multiturn                 Multi-turn tool-call probe (post-tool-result).
- *   doctor                    Preflight system audit — flags GPU/Ollama/host misconfigs.
- *   all                       perf (smart) → toolcall → multiturn, sequentially.
- *   baseline [show|clear]     Inspect or delete baseline.json.
+ *   doctor                    Preflight audit — GPU / Ollama / host config.
+ *   all                       perf (smart) + toolcall + multiturn for --model.
+ *   rank                      Bench --model end-to-end and (re)write its slice in the league.
+ *   league                    Ranked table across all models benched on this machine.
+ *   baseline [show|clear|clear <model>]
+ *                             Inspect, nuke, or drop one model entry.
  *   help                      Print usage.
  *
- * Flags (apply to any subcommand that uses them):
+ * Flags:
  *   --model <tag>             default gemma4:26b
  *   --host <url>              default http://ollama:11434
  *   --runs <n>                per-cell runs, default 3 (perf only)
@@ -23,7 +26,8 @@
  *   --regression-pct <n>      flag threshold, default 5 (perf only)
  *   -v, --verbose             per-case output (toolcall/multiturn)
  *
- * Back-compat: `bench.mjs save|compare|run` still works, routes to `perf`.
+ * Baseline is per-machine, keyed by model (schema v2). Older flat-shaped
+ * baselines auto-migrate on read.
  */
 
 import { existsSync, unlinkSync } from "node:fs";

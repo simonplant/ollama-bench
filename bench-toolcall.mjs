@@ -1,25 +1,30 @@
 #!/usr/bin/env node
 /**
- * Lightweight tool-calling benchmark for local models via the OpenAI-compat
- * Ollama endpoint. Designed around LifeOps tool shapes (email, calendar,
- * tasks, quote, web search).
+ * Single-turn tool-call accuracy probe via Ollama's OpenAI-compatible endpoint.
+ * Uses the LifeOps tool catalogue (email, calendar, tasks, quote, web search)
+ * shared with bench-multiturn.mjs.
  *
  * Usage:
- *   node bench-toolcall.mjs [--model gemma4:26b] [--host http://localhost:11434]
- *                           [--out ./baseline.json] [--save|--compare]
+ *   node bench-toolcall.mjs [--model gemma4:26b] [--host http://ollama:11434]
+ *                           [--out ./baseline.json] [--save|--compare] [-v|--verbose]
  *
- * Default (no --save/--compare) is smart mode: saves if no toolcall section
- * in the baseline, compares otherwise. `--save` forces overwrite; `--compare`
- * errors if the section is missing.
+ * Default mode is smart: saves if --model has no toolcall entry in the
+ * baseline, compares otherwise. --save forces overwrite; --compare errors
+ * if the entry is missing.
  *
  * Scoring per case:
- *   - tool_call_expected + got_call + right_name + args_superset(expected) → PASS
- *   - tool_call_expected=false + no_call_produced                           → PASS
+ *   - tool_call_expected + got_call + accepted_name + args_superset(expected) → PASS
+ *     (accepted_name = expect.name OR any expect.altNames)
+ *   - tool_call_expected=false + no_call_produced                              → PASS
  *   - otherwise FAIL
- * Schema score is independent of tool-name correctness: arguments just need
- * to parse as JSON and satisfy the required-keys check for whichever tool
- * the model actually called. A wrong-tool pick with well-formed args still
- * counts as valid schema fidelity — only malformed/missing args fail schema.
+ *
+ * schema% scores arguments against whichever tool the model actually called,
+ * independently of pick correctness — a wrong-tool pick with well-formed
+ * args still registers valid schema fidelity. Only malformed JSON or missing
+ * required keys fail schema. Pass% deltas flag drops past ±REG_PP (5pp) to
+ * filter run-to-run noise.
+ *
+ * Per-call request timeout: 180s, override via OLLAMA_BENCH_TIMEOUT_MS.
  */
 
 import { TOOLS } from "./bench-tools.mjs";
