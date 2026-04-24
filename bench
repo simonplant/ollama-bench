@@ -46,6 +46,21 @@ if [[ -z "$CONTAINER" ]]; then
     fi
   done
 fi
+# Prefix fallback — matches openclaw-<hash>, engine-openclaw-*, etc. Ambiguity
+# (multiple running containers under the same prefix) is a user decision, so
+# bail out rather than silently picking one.
+if [[ -z "$CONTAINER" ]]; then
+  for prefix in openclaw engine-openclaw; do
+    mapfile -t matches < <(docker ps --filter "name=^${prefix}" --format '{{.Names}}')
+    if (( ${#matches[@]} == 1 )); then
+      CONTAINER="${matches[0]}"; break
+    elif (( ${#matches[@]} > 1 )); then
+      echo "multiple containers match '${prefix}*': ${matches[*]}" >&2
+      echo "set OLLAMA_BENCH_CONTAINER=<name> to disambiguate" >&2
+      exit 1
+    fi
+  done
+fi
 if [[ -z "$CONTAINER" ]]; then
   echo "no sibling container found; set OLLAMA_BENCH_CONTAINER=<name>" >&2
   exit 1
