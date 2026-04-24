@@ -5,11 +5,26 @@
 # it directly but a sibling container can.
 #
 # Configure via environment variables:
-#   OLLAMA_BENCH_CONTAINER   name of the sibling container (must have node 20+
-#                            installed and network access to Ollama).
-#                            Default: tries "openclaw" then "engine-openclaw-1".
-#   OLLAMA_BENCH_REMOTE_DIR  writable path inside the container to stage the
-#                            scripts + baseline. Default: /tmp
+#   OLLAMA_BENCH_CONTAINER          sibling container name (Node 20+, network
+#                                   access to Ollama). Default: tries
+#                                   "openclaw" then "engine-openclaw-1".
+#   OLLAMA_BENCH_OLLAMA_CONTAINER   name of the Ollama container; the wrapper
+#                                   runs `docker inspect` on it to capture
+#                                   OLLAMA_* server env. Default: "ollama".
+#   OLLAMA_BENCH_REMOTE_DIR         writable path inside the sibling for
+#                                   scripts + baseline. Default: /tmp.
+#   OLLAMA_BENCH_MACHINE_ID         stable machine fingerprint seed; auto-
+#                                   populated from /etc/machine-id (or
+#                                   /var/lib/dbus/machine-id) when readable.
+#   OLLAMA_BENCH_TIMEOUT_MS         per-call request timeout override
+#                                   (forwarded to the harness).
+#
+# The wrapper also runs `nvidia-smi` and `docker inspect` on the host and
+# forwards the results into the sibling as OLLAMA_BENCH_GPU_CSV /
+# OLLAMA_BENCH_GPU_EXT_CSV / OLLAMA_BENCH_SERVER_ENV_JSON /
+# OLLAMA_BENCH_CPU_GOVERNOR / OLLAMA_BENCH_SWAP. The harness prefers these
+# over its own probes, so GPU + host + server-env data lands in the baseline
+# even when the sibling can't see them directly.
 #
 # Usage: same as `node bench.mjs`. Passes all arguments through.
 #   ./bench                          # smart perf run for current --model

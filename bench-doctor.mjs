@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 /**
- * ollama-bench doctor — preflight system audit.
+ * `./bench doctor` — system audit for GPU, Ollama server, and host config.
  *
- * Flags host, GPU, and Ollama-server misconfigurations that cap throughput
- * before the benchmark even runs. Each check emits one of:
- *   ✓ ok      — configured well
- *   ⚠ warn    — suboptimal, fixable; fix command included
- *   ✗ fail    — broken or silently degraded; fix command included
- *   · info    — neutral (no action)
- *   ? unknown — couldn't probe (e.g. sysfs unreadable from inside container)
+ * Each check emits one status with a fix command when actionable:
+ *   ✓ ok       configured well
+ *   ⚠ warn     suboptimal, advisory
+ *   ✗ fail     broken or silently degraded; non-zero exit
+ *   · info     neutral
+ *   ? unknown  couldn't probe (e.g. sysfs unreadable from inside container)
  *
- * No auto-remediation — sudo/power-limit/etc. are the user's call.
+ * Read-only — never mutates GPU, Ollama, or host state.
  *
- * Host-side probes (CPU governor, extended nvidia-smi fields, swap) rely on
+ * Host-side probes (CPU governor, extended nvidia-smi fields, swap) read
  * env vars injected by the ./bench wrapper when running Docker-sibling,
- * since the sibling container can't see sysfs or have nvidia-smi on PATH.
+ * since the sibling can't see host sysfs or have nvidia-smi on PATH.
  * Falls back to local commands for direct-on-host invocation.
  */
 
