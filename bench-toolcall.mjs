@@ -31,10 +31,30 @@ const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i +
 const MODEL   = arg("--model", "gemma4:26b");
 const HOST    = arg("--host",  "http://ollama:11434");
 const OUT     = arg("--out",   "./baseline.json");
-const VERBOSE = args.includes("-v");
+const VERBOSE = args.includes("-v") || args.includes("--verbose");
 const MODE    = args.includes("--save")    ? "save"
               : args.includes("--compare") ? "compare"
               : "smart";
+
+// Per-call timeout (ms). Env override lets weaker hardware bump it.
+// Flat ceiling: tool-call responses are short (single message w/ JSON args),
+// but model load + prompt-eval with a tools block can still take ~60s on
+// first request. 180s covers cold-load + generation with comfortable margin.
+function chatTimeoutMs() {
+  const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(override) && override > 0) return override;
+  return 180_000;
+}
+function withTimeout(ms) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  return { signal: ac.signal, cancel: () => clearTimeout(timer) };
+}
+
+// Noise-floor threshold for pass%/schema% deltas. Each category has 5–10
+// cases, so one case flipping is ~10–20pp. Flagging anything negative
+// (the old behavior) turned run-to-run noise into false regressions.
+const REG_PP = 5;
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 // each case: { cat, prompt, expect: { call: bool, name?, args?: {required keys w/ expected value semantics} } }
@@ -51,7 +71,7 @@ const CASES = [
   { cat: "simple",   prompt: "Search the web for latest OpenAI announcements.",      expect: { call: true, name: "web_search" } },
   { cat: "simple",   prompt: "Read email 271.",                                      expect: { call: true, name: "email_read", args: { id: "271" } } },
   // multiple — must disambiguate across tools
-  { cat: "multiple", prompt: "Price of TSLA and create a task to review it tomorrow.", expect: { call: true, name: "quote", args: { symbol: "TSLA" } }, note: "either quote or task_create is acceptable as the first call" },
+  { cat: "multiple", prompt: "Price of TSLA and create a task to review it tomorrow.", expect: { call: true, name: "quote", altNames: ["task_create"], args: { symbol: "TSLA" } } },
   { cat: "multiple", prompt: "Check my inbox, I'm expecting something from the bank.", expect: { call: true, name: "email_inbox" } },
   { cat: "multiple", prompt: "What do I have on my calendar today?",                  expect: { call: true, name: "calendar_events" } },
   { cat: "multiple", prompt: "Find news about AI regulation.",                        expect: { call: true, name: "web_search" } },
@@ -68,17 +88,31 @@ const CASES = [
 
 // ── Runner ───────────────────────────────────────────────────────────────────
 async function runOne(c) {
-  const res = await fetch(`${HOST}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: [{ role: "user", content: c.prompt }],
-      tools: TOOLS,
-      temperature: 0,
-    }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const timeoutMs = chatTimeoutMs();
+  const t = withTimeout(timeoutMs);
+  let res;
+  try {
+    res = await fetch(`${HOST}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [{ role: "user", content: c.prompt }],
+        tools: TOOLS,
+        temperature: 0,
+      }),
+      signal: t.signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`tool-call request timed out after ${timeoutMs}ms — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    throw e;
+  } finally {
+    t.cancel();
+  }
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 200);
+    throw new Error(`HTTP ${res.status}: ${body}`);
+  }
   const j = await res.json();
   const msg = j.choices?.[0]?.message ?? {};
   const calls = msg.tool_calls ?? [];
@@ -116,12 +150,20 @@ function scoreCase(c, out) {
     }
   }
 
-  if (calledName !== c.expect.name) {
-    return { pass: false, schema: schemaOk, reason: `expected ${c.expect.name}, got ${calledName}` };
+  // `altNames` lets a case accept multiple tools as equally correct first
+  // picks — used for prompts that compound ("price of X and add a task…")
+  // where either tool is a defensible choice.
+  const acceptedNames = [c.expect.name, ...(c.expect.altNames ?? [])];
+  if (!acceptedNames.includes(calledName)) {
+    const expectStr = acceptedNames.length === 1 ? c.expect.name : `${c.expect.name} or ${c.expect.altNames.join("/")}`;
+    return { pass: false, schema: schemaOk, reason: `expected ${expectStr}, got ${calledName}` };
   }
+  // arg-level check only applies when the model picked the primary tool —
+  // alts are accepted without arg validation (each would need its own spec).
+  const argsMatter = calledName === c.expect.name && c.expect.args;
   if (!schemaOk) return { pass: false, schema: false, reason: schemaReason };
   // arg-level check (loose — expected is a subset the model MUST reach)
-  if (c.expect.args) {
+  if (argsMatter) {
     for (const [k, v] of Object.entries(c.expect.args)) {
       if (parsed[k] !== v) return { pass: false, schema: true, reason: `arg ${k}: got ${JSON.stringify(parsed[k])}, expected ${JSON.stringify(v)}` };
     }
@@ -172,7 +214,10 @@ function fmtPct(n)   { return `${n.toFixed(0)}%`; }
 function fmtDelta(d) {
   if (d === null || d === undefined || !Number.isFinite(d)) return "—";
   const sign = d >= 0 ? "+" : "";
-  const tag  = d < 0 ? " ⚠" : "";
+  // Flag only drops past the noise-floor threshold — a 1-case flip in a
+  // 10-case category is ~10pp and represents real signal; sub-5pp drops
+  // are typically reorderings of near-tie picks.
+  const tag  = d < -REG_PP ? " ⚠" : "";
   return `${sign}${d.toFixed(0)}pp${tag}`;
 }
 
@@ -229,9 +274,9 @@ function printReport(current, base) {
       }
     }
     const overallDelta = (100 * current.pass / current.total) - (100 * base.pass / base.total);
-    if (overallDelta < 0)      console.log(`\n⚠ overall pass% regressed ${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
-    else if (overallDelta > 0) console.log(`\n✓ overall pass% improved +${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
-    else                       console.log(`\n✓ overall pass% unchanged vs baseline (saved ${base.savedAt})`);
+    if (overallDelta < -REG_PP)      console.log(`\n⚠ overall pass% regressed ${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else if (overallDelta > REG_PP)  console.log(`\n✓ overall pass% improved +${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else                             console.log(`\n✓ overall pass% within ±${REG_PP}pp of baseline (saved ${base.savedAt})`);
   } else if (current.failedPrompts.length) {
     console.log("\nfailures:");
     for (const f of current.failedPrompts) {
