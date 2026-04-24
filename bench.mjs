@@ -157,15 +157,21 @@ function timeoutMsFor(numPredict) {
 }
 
 async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
+  // Streaming mode so we can timestamp the first token's arrival for TTFT.
+  // Ollama returns NDJSON: one JSON object per line. First object with a
+  // non-empty `response` field is the first decoded token; final object
+  // (done=true) carries the duration fields we used to read from a
+  // non-streamed response.
   const body = {
     model: MODEL,
     prompt,
-    stream: false,
+    stream: true,
     options: { num_predict: numPredict, temperature: 0, seed: 42 },
   };
   if (keepAlive !== undefined) body.keep_alive = keepAlive;
   const timeoutMs = timeoutMsFor(numPredict);
   const t = withTimeout(timeoutMs);
+  const t0 = performance.now();
   let res;
   try {
     res = await fetch(`${HOST}/api/generate`, {
@@ -175,21 +181,56 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
       signal: t.signal,
     });
   } catch (e) {
+    t.cancel();
     if (e.name === "AbortError") throw new Error(`Ollama /api/generate timed out after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    throw e;
+  }
+  if (!res.ok) {
+    t.cancel();
+    throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  }
+
+  let firstTokenMs = null;
+  let final = null;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const j = JSON.parse(line);
+        // TTFT = wall time until first chunk with a non-empty decoded token.
+        // Prompt-eval happens before this fires, so TTFT includes prompt
+        // processing — which is what an interactive user actually feels.
+        if (firstTokenMs === null && j.response && j.response.length > 0) {
+          firstTokenMs = performance.now() - t0;
+        }
+        if (j.done) final = j;
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`Ollama stream aborted after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
     throw e;
   } finally {
     t.cancel();
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-  const j = await res.json();
+  if (!final) throw new Error("Ollama stream ended without a done=true chunk");
   return {
-    promptTokens:    j.prompt_eval_count ?? 0,
-    genTokens:       j.eval_count ?? 0,
-    promptTps:       j.prompt_eval_count / (j.prompt_eval_duration / 1e9),
-    genTps:          j.eval_count / (j.eval_duration / 1e9),
-    totalMs:         j.total_duration / 1e6,
-    loadMs:          (j.load_duration ?? 0) / 1e6,
-    evalDurationMs:  (j.eval_duration ?? 0) / 1e6,
+    promptTokens:    final.prompt_eval_count ?? 0,
+    genTokens:       final.eval_count ?? 0,
+    promptTps:       final.prompt_eval_count / (final.prompt_eval_duration / 1e9),
+    genTps:          final.eval_count / (final.eval_duration / 1e9),
+    totalMs:         final.total_duration / 1e6,
+    loadMs:          (final.load_duration ?? 0) / 1e6,
+    evalDurationMs:  (final.eval_duration ?? 0) / 1e6,
+    firstTokenMs,
   };
 }
 
@@ -225,13 +266,17 @@ async function scenarioSingleStream(isSave) {
   const results = [];
   for (let i = 0; i < CTX_SIZES.length; i++) {
     const cell = CTX_SIZES[i];
-    const pTps = [], gTps = [], total = [], load = [];
+    const pTps = [], gTps = [], total = [], load = [], ttft = [];
     for (let r = 0; r < runsHere; r++) {
       const out = await generate(mkPrompt(i, r), { numPredict: cell.numPredict });
       pTps.push(out.promptTps);
       gTps.push(out.genTps);
       total.push(out.totalMs);
       load.push(out.loadMs);
+      // firstTokenMs can be null if numPredict is so small that no decoded
+      // chunk arrives (effectively never here — numPredict ≥ 128 in every
+      // cell). Guard anyway so null doesn't poison the median.
+      if (out.firstTokenMs !== null) ttft.push(out.firstTokenMs);
     }
     results.push({
       ctx: cell.label,
@@ -239,10 +284,12 @@ async function scenarioSingleStream(isSave) {
       genTps:    median(gTps),
       totalMs:   median(total),
       loadMs:    median(load),
+      firstTokenMs: ttft.length > 0 ? median(ttft) : null,
       cv: isSave ? {
         promptTps: cvPct(pTps),
         genTps:    cvPct(gTps),
         totalMs:   cvPct(total),
+        firstTokenMs: ttft.length > 1 ? cvPct(ttft) : 0,
       } : undefined,
     });
   }
@@ -256,7 +303,11 @@ async function scenarioSingleStream(isSave) {
 const COLD_START_CYCLES = 3;
 
 async function scenarioColdStart() {
-  const loads = [], walls = [], tpss = [];
+  // Median over N cycles to tame variance (single-sample swung ±20% on NVMe);
+  // each cycle also captures firstTokenMs so cold TTFT is measured separately
+  // from cold full-reply wall time. firstTokenMs may be null per cycle if no
+  // decoded chunk arrives — guard the median against null pollution.
+  const loads = [], walls = [], tpss = [], ttfts = [];
   for (let i = 0; i < COLD_START_CYCLES; i++) {
     // Force model eviction by setting keep_alive=0s on a short request, then
     // measure the NEXT request's load_duration + time-to-useful-response.
@@ -269,8 +320,14 @@ async function scenarioColdStart() {
     loads.push(out.loadMs);
     walls.push(performance.now() - t0);
     tpss.push(out.genTps);
+    if (out.firstTokenMs !== null) ttfts.push(out.firstTokenMs);
   }
-  return { loadMs: median(loads), firstPromptWallMs: median(walls), genTps: median(tpss) };
+  return {
+    loadMs: median(loads),
+    firstPromptWallMs: median(walls),
+    firstTokenMs: ttfts.length > 0 ? median(ttfts) : null,
+    genTps: median(tpss),
+  };
 }
 
 async function scenarioConcurrent(isSave, levels = [1, 2, 4, 8]) {
@@ -532,11 +589,20 @@ function collectRegressions(cur, base) {
     if (!b) continue;
     check(`${row.ctx} prompt t/s`, row.promptTps, b.promptTps, "higher", b.cv?.promptTps);
     check(`${row.ctx} gen t/s`,    row.genTps,    b.genTps,    "higher", b.cv?.genTps);
+    // firstTokenMs is additive to the schema — old baselines won't have it.
+    // Only compare when both sides are present; missing current is null,
+    // missing baseline is undefined.
+    if (row.firstTokenMs != null && b.firstTokenMs != null) {
+      check(`${row.ctx} ttft ms`, row.firstTokenMs, b.firstTokenMs, "lower", b.cv?.firstTokenMs);
+    }
     check(`${row.ctx} total ms`,   row.totalMs,   b.totalMs,   "lower",  b.cv?.totalMs);
   }
   if (base?.coldStart && cur.coldStart) {
     check("cold-start load ms",       cur.coldStart.loadMs,            base.coldStart.loadMs,            "lower");
     check("cold-start first wall ms", cur.coldStart.firstPromptWallMs, base.coldStart.firstPromptWallMs, "lower");
+    if (cur.coldStart.firstTokenMs != null && base.coldStart.firstTokenMs != null) {
+      check("cold-start ttft ms",     cur.coldStart.firstTokenMs,      base.coldStart.firstTokenMs,      "lower");
+    }
     check("cold-start gen t/s",       cur.coldStart.genTps,            base.coldStart.genTps,            "higher");
   }
   for (const row of cur.concurrent ?? []) {
@@ -564,6 +630,9 @@ function printHeadline(cur, envSnap) {
   const bold = (n, suffix) => col.bold(n) + (suffix ? col.dim(suffix) : "");
 
   console.log("  " + label("Single-user chat") + bold(fmtFloat(short.genTps, 0) + " tok/s") + col.dim(`  (short prompt)`));
+  if (short.firstTokenMs != null) {
+    console.log("  " + label("First-token latency") + bold(fmtInt(short.firstTokenMs) + " ms") + col.dim("  (what an interactive user feels)"));
+  }
   console.log("  " + label("Long generations")  + bold(fmtFloat(longGen.genTps, 0) + " tok/s") + col.dim(`  (sustained)`));
   console.log("  " + label("Cold start")        + bold(fmtFloat(cur.coldStart.loadMs / 1000, 1) + "s") + col.dim(" model load + ") + bold(fmtFloat(cur.coldStart.firstPromptWallMs / 1000, 1) + "s") + col.dim(" first prompt"));
   if (serialized && nMax && n1) {
@@ -580,20 +649,28 @@ function printSingleStream(cur, base) {
     { label: "ctx",        align: "l" },
     { label: "prompt t/s", align: "r" },
     { label: "gen t/s",    align: "r" },
+    { label: "ttft ms",    align: "r" },
     { label: "total ms",   align: "r" },
     { label: "Δ prompt",   align: "r" },
     { label: "Δ gen",      align: "r" },
+    { label: "Δ ttft",     align: "r" },
     { label: "Δ total",    align: "r" },
   ];
   const rows = cur.map(row => {
     const b = base?.singleStream?.find(r => r.ctx === row.ctx);
+    const ttftCell = row.firstTokenMs != null ? fmtInt(row.firstTokenMs) : col.dim("—");
+    const ttftDelta = (b && row.firstTokenMs != null && b.firstTokenMs != null)
+      ? fmtDelta(pctDelta(row.firstTokenMs, b.firstTokenMs), "lower", b.cv?.firstTokenMs)
+      : col.dim("—");
     return [
       row.ctx,
       fmtInt(row.promptTps),
       fmtFloat(row.genTps, 1),
+      ttftCell,
       fmtInt(row.totalMs),
       b ? fmtDelta(pctDelta(row.promptTps, b.promptTps), "higher", b.cv?.promptTps) : col.dim("—"),
       b ? fmtDelta(pctDelta(row.genTps,    b.genTps),    "higher", b.cv?.genTps)    : col.dim("—"),
+      ttftDelta,
       b ? fmtDelta(pctDelta(row.totalMs,   b.totalMs),   "lower",  b.cv?.totalMs)   : col.dim("—"),
     ];
   });
@@ -610,8 +687,13 @@ function printColdStart(cur, base) {
   const rows = [
     ["load ms",              fmtInt(cur.loadMs),            base ? fmtDelta(pctDelta(cur.loadMs,            base.coldStart.loadMs),            "lower")  : col.dim("—")],
     ["first prompt wall ms", fmtInt(cur.firstPromptWallMs), base ? fmtDelta(pctDelta(cur.firstPromptWallMs, base.coldStart.firstPromptWallMs), "lower")  : col.dim("—")],
-    ["gen t/s",              fmtFloat(cur.genTps, 1),       base ? fmtDelta(pctDelta(cur.genTps,            base.coldStart.genTps),            "higher") : col.dim("—")],
   ];
+  if (cur.firstTokenMs != null) {
+    const baseTtft = base?.coldStart?.firstTokenMs;
+    const delta = baseTtft != null ? fmtDelta(pctDelta(cur.firstTokenMs, baseTtft), "lower") : col.dim("—");
+    rows.push(["ttft ms", fmtInt(cur.firstTokenMs), delta]);
+  }
+  rows.push(["gen t/s", fmtFloat(cur.genTps, 1), base ? fmtDelta(pctDelta(cur.genTps, base.coldStart.genTps), "higher") : col.dim("—")]);
   console.log(renderTable(columns, rows));
 }
 
@@ -717,12 +799,23 @@ function validateBaselineShape(b) {
     for (const k of ["promptTps", "genTps", "totalMs"]) {
       if (!finite(r?.[k])) errs.push(`singleStream[${r?.ctx}].${k} not finite (${r?.[k]})`);
     }
+    // firstTokenMs is allowed to be null (no decoded chunk seen), but if
+    // present must be finite — NaN/Infinity would leak from a malformed
+    // stream response and we'd rather refuse the save than persist garbage.
+    if (r?.firstTokenMs !== null && r?.firstTokenMs !== undefined && !finite(r.firstTokenMs)) {
+      errs.push(`singleStream[${r?.ctx}].firstTokenMs not finite (${r.firstTokenMs})`);
+    }
   }
 
   const cs = b?.coldStart;
   if (!cs) errs.push("coldStart missing");
-  else for (const k of ["loadMs", "firstPromptWallMs", "genTps"]) {
-    if (!finite(cs[k])) errs.push(`coldStart.${k} not finite (${cs[k]})`);
+  else {
+    for (const k of ["loadMs", "firstPromptWallMs", "genTps"]) {
+      if (!finite(cs[k])) errs.push(`coldStart.${k} not finite (${cs[k]})`);
+    }
+    if (cs.firstTokenMs !== null && cs.firstTokenMs !== undefined && !finite(cs.firstTokenMs)) {
+      errs.push(`coldStart.firstTokenMs not finite (${cs.firstTokenMs})`);
+    }
   }
 
   const co = b?.concurrent;
