@@ -12,12 +12,11 @@
 #                            scripts + baseline. Default: /tmp
 #
 # Usage: same as `node bench.mjs`. Passes all arguments through.
-#   ./bench                  # smart perf run
-#   ./bench doctor           # preflight system audit
-#   ./bench perf save        # save new baseline
-#   ./bench toolcall         # tool-call probe
-#   ./bench all              # everything
-#   ./bench --help           # usage
+#   ./bench                          # smart perf run for current --model
+#   ./bench rank --model qwen3:30b   # add or refresh a model in the league
+#   ./bench league                   # ranked table across all benched models
+#   ./bench doctor                   # preflight system audit
+#   ./bench --help                   # full CLI
 
 set -euo pipefail
 
@@ -47,7 +46,7 @@ REMOTE_BASELINE="$REMOTE_DIR/ollama-bench-baseline.json"
 # The unified CLI spawns the probe scripts as siblings, and both probes
 # import the shared tool catalogue, so all four files must live next to
 # each other in the container. Fail fast if any are missing on the host.
-SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs bench-doctor.mjs)
+SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs bench-doctor.mjs bench-baseline.mjs)
 MISSING=()
 for script in "${SCRIPTS[@]}"; do
   [[ -f "$HERE/$script" ]] || MISSING+=("$script")
