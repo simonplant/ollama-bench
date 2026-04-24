@@ -38,6 +38,19 @@ function tryExec(cmd) {
   catch { return null; }
 }
 
+// Doctor's job is to diagnose a misconfigured system — including one where
+// Ollama itself is hung. Bare `fetch()` waits indefinitely; a short deadline
+// turns "hang forever" into "fail the API-reachable check and report".
+async function fetchWithTimeout(url, opts = {}, ms = 10_000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── GPU ──────────────────────────────────────────────────────────────────────
 // Extended field set — superset of what perf bench captures. Mirror any field
 // changes in the ./bench wrapper's OLLAMA_BENCH_GPU_EXT_CSV producer.
@@ -98,11 +111,12 @@ function checkGpu() {
 async function checkOllama() {
   let ver = null;
   try {
-    const r = await fetch(`${HOST}/api/version`);
+    const r = await fetchWithTimeout(`${HOST}/api/version`);
     if (r.ok) ver = (await r.json()).version;
-  } catch {
+  } catch (e) {
+    const reason = e.name === "AbortError" ? "timed out after 10s" : e.message;
     fail("ollama", "API reachable",
-      `cannot reach ${HOST}/api/version`,
+      `cannot reach ${HOST}/api/version (${reason})`,
       "check --host value and container networking");
     return;
   }
@@ -171,7 +185,7 @@ async function checkOllama() {
 
   // Model presence check — not fatal, just informative.
   try {
-    const r = await fetch(`${HOST}/api/tags`);
+    const r = await fetchWithTimeout(`${HOST}/api/tags`);
     if (r.ok) {
       const j = await r.json();
       const hit = (j.models ?? []).find(m => m.name === MODEL || m.model === MODEL);

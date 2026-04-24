@@ -46,10 +46,28 @@ const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i +
 const MODEL   = arg("--model", "gemma4:26b");
 const HOST    = arg("--host",  "http://ollama:11434");
 const OUT     = arg("--out",   "./baseline.json");
-const VERBOSE = args.includes("-v");
+const VERBOSE = args.includes("-v") || args.includes("--verbose");
 const MODE    = args.includes("--save")    ? "save"
               : args.includes("--compare") ? "compare"
               : "smart";
+
+// Per-call timeout (ms). Each case does two chat turns, so we apply the
+// timeout per turn and let OLLAMA_BENCH_TIMEOUT_MS override if weaker
+// hardware needs more headroom.
+function chatTimeoutMs() {
+  const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
+  if (Number.isFinite(override) && override > 0) return override;
+  return 180_000;
+}
+function withTimeout(ms) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  return { signal: ac.signal, cancel: () => clearTimeout(timer) };
+}
+
+// Noise floor for pass% delta (pp). One case flip = 100/14 ≈ 7pp; drops
+// below this are typically reorderings, not regressions.
+const REG_PP = 5;
 
 // ── Cases ────────────────────────────────────────────────────────────────────
 // rule: "FINAL" | "CHAIN:<tool>" | "EMPTY_OK"
@@ -124,12 +142,26 @@ const CASES = [
 
 // ── Runner ───────────────────────────────────────────────────────────────────
 async function chat(messages) {
-  const res = await fetch(`${HOST}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: MODEL, messages, tools: TOOLS, temperature: 0 }),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const timeoutMs = chatTimeoutMs();
+  const t = withTimeout(timeoutMs);
+  let res;
+  try {
+    res = await fetch(`${HOST}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: MODEL, messages, tools: TOOLS, temperature: 0 }),
+      signal: t.signal,
+    });
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error(`multiturn chat timed out after ${timeoutMs}ms — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    throw e;
+  } finally {
+    t.cancel();
+  }
+  if (!res.ok) {
+    const body = (await res.text()).slice(0, 200);
+    throw new Error(`HTTP ${res.status}: ${body}`);
+  }
   const j = await res.json();
   return j.choices?.[0]?.message ?? {};
 }
@@ -221,7 +253,8 @@ function fmtPct(n)   { return `${n.toFixed(0)}%`; }
 function fmtDelta(d) {
   if (d === null || d === undefined || !Number.isFinite(d)) return "—";
   const sign = d >= 0 ? "+" : "";
-  const tag  = d < 0 ? " ⚠" : "";
+  // One case flip in 14 ≈ 7pp; sub-REG_PP drops aren't meaningful signal.
+  const tag  = d < -REG_PP ? " ⚠" : "";
   return `${sign}${d.toFixed(0)}pp${tag}`;
 }
 
@@ -274,9 +307,9 @@ function printReport(current, base) {
       }
     }
     const overallDelta = (100 * current.pass / current.total) - (100 * base.pass / base.total);
-    if (overallDelta < 0)      console.log(`\n⚠ overall pass% regressed ${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
-    else if (overallDelta > 0) console.log(`\n✓ overall pass% improved +${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
-    else                       console.log(`\n✓ overall pass% unchanged vs baseline (saved ${base.savedAt})`);
+    if (overallDelta < -REG_PP)      console.log(`\n⚠ overall pass% regressed ${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else if (overallDelta > REG_PP)  console.log(`\n✓ overall pass% improved +${overallDelta.toFixed(0)}pp vs baseline (saved ${base.savedAt})`);
+    else                             console.log(`\n✓ overall pass% within ±${REG_PP}pp of baseline (saved ${base.savedAt})`);
   } else if (current.failedPrompts.length) {
     console.log("\nfailures:");
     for (const f of current.failedPrompts) {

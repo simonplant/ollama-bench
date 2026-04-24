@@ -56,11 +56,25 @@ function parseArgs(argv) {
 }
 const PARSED = parseArgs(args);
 
+// Strict numeric parsing — an invalid flag like `--runs foo` used to produce
+// NaN and silently no-op (loops never executed, thresholds always passed).
+// Better to fail fast with a message than to produce a garbage baseline.
+function parsePosInt(raw, name) {
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) { console.error(`invalid --${name}: ${raw} (expected positive integer)`); process.exit(2); }
+  return n;
+}
+function parseNonNegFloat(raw, name) {
+  const n = parseFloat(raw);
+  if (!Number.isFinite(n) || n < 0) { console.error(`invalid --${name}: ${raw} (expected non-negative number)`); process.exit(2); }
+  return n;
+}
+
 const MODEL     = arg("--model", "gemma4:26b");
 const HOST      = arg("--host",  "http://ollama:11434");
-const RUNS      = parseInt(arg("--runs", "3"), 10);
+const RUNS      = parsePosInt(arg("--runs", "3"), "runs");
 const OUT       = arg("--out",   "./baseline.json");
-const REG_PCT   = parseFloat(arg("--regression-pct", "5"));
+const REG_PCT   = parseNonNegFloat(arg("--regression-pct", "5"), "regression-pct");
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 // Deterministic seed so "fresh prefix per run" is still reproducible across
@@ -235,16 +249,28 @@ async function scenarioSingleStream(isSave) {
   return results;
 }
 
+// Cold-start cycle count. Single-sample had ±20% run-to-run variance on
+// NVMe-loaded 26B models, which made cold-start deltas nearly unreadable.
+// Three samples + median brings variance into the same band as the warm
+// scenarios while still finishing in ~2 minutes total.
+const COLD_START_CYCLES = 3;
+
 async function scenarioColdStart() {
-  // Force model eviction by setting keep_alive=0s on a short request, then
-  // measure the NEXT request's load_duration + time-to-useful-response.
-  // Prefix with PROCESS_NONCE so back-to-back runs don't share a prompt.
-  await generate(`[${PROCESS_NONCE}/cold/evict] bye`, { keepAlive: "0s", numPredict: 1 });
-  await new Promise(r => setTimeout(r, 1500)); // let eviction settle
-  const t0 = performance.now();
-  const out = await generate(`[${PROCESS_NONCE}/cold/measure] Say hi in five words.`, { numPredict: 16 });
-  const wall = performance.now() - t0;
-  return { loadMs: out.loadMs, firstPromptWallMs: wall, genTps: out.genTps };
+  const loads = [], walls = [], tpss = [];
+  for (let i = 0; i < COLD_START_CYCLES; i++) {
+    // Force model eviction by setting keep_alive=0s on a short request, then
+    // measure the NEXT request's load_duration + time-to-useful-response.
+    // Prefix each cycle with PROCESS_NONCE + index so back-to-back cycles
+    // don't share a prompt prefix.
+    await generate(`[${PROCESS_NONCE}/cold/evict/${i}] bye`, { keepAlive: "0s", numPredict: 1 });
+    await new Promise(r => setTimeout(r, 1500)); // let eviction settle
+    const t0 = performance.now();
+    const out = await generate(`[${PROCESS_NONCE}/cold/measure/${i}] Say hi in five words.`, { numPredict: 16 });
+    loads.push(out.loadMs);
+    walls.push(performance.now() - t0);
+    tpss.push(out.genTps);
+  }
+  return { loadMs: median(loads), firstPromptWallMs: median(walls), genTps: median(tpss) };
 }
 
 async function scenarioConcurrent(isSave, levels = [1, 2, 4, 8]) {
@@ -745,7 +771,7 @@ async function runPerf(mode) {
   if (isSave) console.log("(save mode — extra runs to measure per-cell noise)");
   console.log("\n[1/3] single-stream sizes…");
   const singleStream = await scenarioSingleStream(isSave);
-  console.log("[2/3] cold-start…");
+  console.log(`[2/3] cold-start (${COLD_START_CYCLES} cycles)…`);
   const coldStart = await scenarioColdStart();
   console.log("[3/3] concurrent streams…");
   const concurrent = await scenarioConcurrent(isSave);
