@@ -76,7 +76,7 @@ REMOTE_BASELINE="$REMOTE_DIR/ollama-bench-baseline.json"
 # The unified CLI spawns the probe scripts as siblings, and both probes
 # import the shared tool catalogue, so all four files must live next to
 # each other in the container. Fail fast if any are missing on the host.
-SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs bench-doctor.mjs bench-baseline.mjs)
+SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-jobs.mjs bench-tools.mjs bench-doctor.mjs bench-baseline.mjs)
 MISSING=()
 for script in "${SCRIPTS[@]}"; do
   [[ -f "$HERE/$script" ]] || MISSING+=("$script")

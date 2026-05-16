@@ -10,10 +10,14 @@
  *   perf [save|compare|run]   Throughput benchmark. No mode → smart default.
  *   toolcall                  Single-turn tool-call accuracy probe.
  *   multiturn                 Multi-turn tool-call probe (post-tool-result).
+ *   jobs                      Judge-scored quality probe across job roles
+ *                             (trading_brief, x_analysis, document_prep,
+ *                             hard_toolcall, reasoning).
  *   doctor                    Preflight audit — GPU / Ollama / host config.
- *   all                       perf (smart) + toolcall + multiturn for --model.
+ *   all                       perf (smart) + toolcall + multiturn + jobs for --model.
  *   rank                      Bench --model end-to-end and (re)write its slice in the league.
  *   league                    Ranked table across all models benched on this machine.
+ *   routes                    Best-in-breed model per job, with quality-per-second view.
  *   baseline [show|clear|clear <model>]
  *                             Inspect, nuke, or drop one model entry.
  *   help                      Print usage.
@@ -55,7 +59,7 @@ const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i +
 
 // Flags that consume the next argv entry as their value. Anything else
 // starting with `-` is a boolean; anything else is positional.
-const VALUE_FLAGS = new Set(["--model", "--host", "--runs", "--out", "--regression-pct"]);
+const VALUE_FLAGS = new Set(["--model", "--host", "--runs", "--out", "--regression-pct", "--judge"]);
 function parseArgs(argv) {
   const flags = [], positional = [];
   for (let i = 0; i < argv.length; i++) {
@@ -961,15 +965,17 @@ function spawnSibling(script, extraArgs = []) {
 }
 
 async function runAll() {
-  console.log("=== [1/3] perf ===");
+  console.log("=== [1/4] perf ===");
   await runPerf("smart");
-  console.log("\n=== [2/3] toolcall ===");
+  console.log("\n=== [2/4] toolcall ===");
   await spawnSibling("bench-toolcall.mjs");
-  console.log("\n=== [3/3] multiturn ===");
+  console.log("\n=== [3/4] multiturn ===");
   await spawnSibling("bench-multiturn.mjs");
+  console.log("\n=== [4/4] jobs ===");
+  await spawnSibling("bench-jobs.mjs");
 }
 
-// rank — bench MODEL across all three probes and (re)write its slice in the
+// rank — bench MODEL across every probe and (re)write its slice in the
 // league. Distinct from `all` which keeps smart compare semantics; rank is
 // the explicit "add or refresh this model in the league" verb.
 async function runRank() {
@@ -979,7 +985,9 @@ async function runRank() {
   await spawnSibling("bench-toolcall.mjs", ["--save"]);
   console.log(`\n=== rank ${MODEL} (multiturn) ===`);
   await spawnSibling("bench-multiturn.mjs", ["--save"]);
-  console.log(`\n${col.green("✓")} ${MODEL} added to league. Run './bench league' to see the table.`);
+  console.log(`\n=== rank ${MODEL} (jobs) ===`);
+  await spawnSibling("bench-jobs.mjs", ["--save"]);
+  console.log(`\n${col.green("✓")} ${MODEL} added to league. Run './bench league' or './bench routes' to compare.`);
 }
 
 // ── League ──────────────────────────────────────────────────────────────────
@@ -1002,6 +1010,7 @@ function leagueRowFor(entry) {
   const c4 = co.find(r => r.parallel === 4) ?? null;
   const tc = entry.toolcall ?? null;
   const mt = entry.multiturn ?? null;
+  const jb = entry.jobs ?? null;
   return {
     tag:           entry.tag,
     params:        entry.perf?.env?.modelParams ?? null,
@@ -1012,6 +1021,7 @@ function leagueRowFor(entry) {
     n4PerStream:   c4?.perStreamGenTps ?? null,
     toolPct:       tc != null && tc.total > 0 ? (100 * tc.pass / tc.total) : null,
     multiPct:      mt != null && mt.total > 0 ? (100 * mt.pass / mt.total) : null,
+    jobsScore:     jb?.overall?.score ?? null,
     savedAt:       entry.savedAt,
   };
 }
@@ -1043,6 +1053,7 @@ function cmdLeague() {
     { label: "n=4 t/s",   align: "r" },
     { label: "tool %",    align: "r" },
     { label: "multi %",   align: "r" },
+    { label: "jobs",      align: "r" },
     { label: "age",       align: "r" },
   ];
   const dash = col.dim("—");
@@ -1056,6 +1067,7 @@ function cmdLeague() {
     r.n4PerStream != null ? fmtFloat(r.n4PerStream, 1)  : dash,
     r.toolPct     != null ? `${r.toolPct.toFixed(0)}%`  : dash,
     r.multiPct    != null ? `${r.multiPct.toFixed(0)}%` : dash,
+    r.jobsScore   != null ? fmtFloat(r.jobsScore, 1)    : dash,
     fmtAge(r.savedAt),
   ]);
   console.log(renderTable(cols, cells));
@@ -1069,6 +1081,114 @@ function cmdLeague() {
     console.log(col.dim(`\n⚠ ${stale.length} entr${stale.length === 1 ? "y" : "ies"} older than ${STALE_DAYS} days — re-run './bench rank --model <tag>' to refresh.`));
   }
   console.log(col.dim(`\nsorted by short-prompt gen t/s. Add or refresh: './bench rank --model <tag>'`));
+}
+
+// ── Routes ──────────────────────────────────────────────────────────────────
+// Reads the jobs section across every model and prints the per-job winner.
+// Two views: by raw quality score, and quality-per-second (score × short-prompt
+// gen t/s) to flag tradeoffs where a smaller-faster model is the better
+// router choice.
+function cmdRoutes() {
+  const models = listModels(OUT);
+  if (models.length === 0) {
+    console.log(`no models in baseline at ${OUT} — run './bench rank --model <tag>' to add one`);
+    return;
+  }
+  const withJobs = models.filter(m => m.jobs?.byJob);
+  if (withJobs.length === 0) {
+    console.log(`no models have a jobs entry yet — run './bench jobs --model <tag>' (or './bench rank') on at least one model first`);
+    return;
+  }
+
+  // Collect every job name across all models so a partial set still produces a
+  // table; missing entries are dashes.
+  const jobs = new Set();
+  for (const m of withJobs) for (const j of Object.keys(m.jobs.byJob)) jobs.add(j);
+  const jobList = [...jobs].sort();
+
+  // Per-job leaderboard: for each job, sort models by score desc.
+  // Tag → short-prompt gen t/s used as the throughput proxy in the
+  // quality-per-second view.
+  const shortTpsByTag = Object.fromEntries(models.map(m => [
+    m.tag,
+    m.perf?.singleStream?.find(r => r.ctx === "short")?.genTps ?? null,
+  ]));
+
+  console.log(`\n${col.bold("Routes")} — best-in-breed per job`);
+  console.log(col.dim(`  judge: ${withJobs[0].jobs.judge ?? "?"} (across ${withJobs.length} model${withJobs.length === 1 ? "" : "s"})`));
+
+  // ── View 1: by quality ─────────────────────────────────────────────────
+  const qualityCols = [
+    { label: "job",         align: "l" },
+    { label: "winner",      align: "l" },
+    { label: "score",       align: "r" },
+    { label: "wall t/s",    align: "r" },
+    { label: "runner-up",   align: "l" },
+    { label: "Δ",           align: "r" },
+  ];
+  const qualityRows = jobList.map(job => {
+    const ranked = withJobs
+      .filter(m => m.jobs.byJob[job])
+      .map(m => ({ tag: m.tag, ...m.jobs.byJob[job] }))
+      .sort((a, b) => b.score - a.score);
+    if (ranked.length === 0) return [job, col.dim("—"), col.dim("—"), col.dim("—"), col.dim("—"), col.dim("—")];
+    const win = ranked[0], next = ranked[1];
+    return [
+      job,
+      col.green(win.tag),
+      fmtFloat(win.score, 1),
+      fmtFloat(win.wallTokPerSec ?? 0, 1),
+      next ? next.tag : col.dim("—"),
+      next ? col.dim(`-${(win.score - next.score).toFixed(1)}`) : col.dim("—"),
+    ];
+  });
+  console.log("\n" + col.bold("[by quality]"));
+  console.log(renderTable(qualityCols, qualityRows));
+
+  // ── View 2: quality-per-second ─────────────────────────────────────────
+  // qps = score × short-prompt gen t/s, scaled / 100 to keep numbers readable.
+  // Surfaces "good-enough fast model" wins that pure-quality view hides.
+  const qpsCols = [
+    { label: "job",         align: "l" },
+    { label: "winner",      align: "l" },
+    { label: "qps",         align: "r" },
+    { label: "score",       align: "r" },
+    { label: "tok/s",       align: "r" },
+    { label: "runner-up",   align: "l" },
+  ];
+  const qpsRows = jobList.map(job => {
+    const ranked = withJobs
+      .filter(m => m.jobs.byJob[job] && shortTpsByTag[m.tag] != null)
+      .map(m => {
+        const s = m.jobs.byJob[job].score;
+        const t = shortTpsByTag[m.tag];
+        return { tag: m.tag, score: s, tps: t, qps: (s * t) / 100 };
+      })
+      .sort((a, b) => b.qps - a.qps);
+    if (ranked.length === 0) return [job, col.dim("—"), col.dim("—"), col.dim("—"), col.dim("—"), col.dim("—")];
+    const win = ranked[0], next = ranked[1];
+    return [
+      job,
+      col.green(win.tag),
+      fmtFloat(win.qps, 1),
+      fmtFloat(win.score, 1),
+      fmtFloat(win.tps, 0),
+      next ? next.tag : col.dim("—"),
+    ];
+  });
+  console.log("\n" + col.bold("[by quality-per-second]") + col.dim("   qps = score × short-prompt gen t/s ÷ 100"));
+  console.log(renderTable(qpsCols, qpsRows));
+
+  // Stale flag — if any model's jobs entry is older than STALE_DAYS, mention.
+  const stale = withJobs.filter(m => {
+    const t = m.jobs.savedAt;
+    if (!t) return false;
+    return (Date.now() - new Date(t).getTime()) / (24 * 3600 * 1000) > STALE_DAYS;
+  });
+  if (stale.length) {
+    console.log(col.dim(`\n⚠ ${stale.length} jobs entr${stale.length === 1 ? "y" : "ies"} older than ${STALE_DAYS} days — re-run './bench jobs --model <tag> --save' to refresh.`));
+  }
+  console.log(col.dim(`\nadd/refresh: './bench jobs --model <tag> --save' or './bench rank --model <tag>'`));
 }
 
 function cmdBaseline(sub, arg) {
@@ -1097,7 +1217,7 @@ function cmdBaseline(sub, arg) {
   for (const m of models) {
     const tag = m.tag;
     const ageDays = m.savedAt ? Math.floor((Date.now() - new Date(m.savedAt).getTime()) / (24 * 3600 * 1000)) : null;
-    const sections = ["perf", "toolcall", "multiturn"].filter(s => m[s]).join("+") || "(empty)";
+    const sections = ["perf", "toolcall", "multiturn", "jobs"].filter(s => m[s]).join("+") || "(empty)";
     console.log(`    ${tag.padEnd(28)}  [${sections}]  ${ageDays != null ? ageDays + "d ago" : "?"}`);
     if (m.perf?.singleStream) {
       console.log(`        gen t/s: ${m.perf.singleStream.map(r => `${r.ctx}=${(r.genTps ?? 0).toFixed(1)}`).join("  ")}`);
@@ -1110,6 +1230,10 @@ function cmdBaseline(sub, arg) {
     if (m.multiturn && m.multiturn.total > 0) {
       const pp = (100 * m.multiturn.pass / m.multiturn.total).toFixed(0);
       console.log(`        multiturn: ${m.multiturn.pass}/${m.multiturn.total} pass (${pp}%)`);
+    }
+    if (m.jobs?.byJob) {
+      const jobs = Object.entries(m.jobs.byJob).map(([j, r]) => `${j}=${r.score.toFixed(0)}`).join("  ");
+      console.log(`        jobs:      overall ${m.jobs.overall?.score?.toFixed(0) ?? "?"} (judge ${m.jobs.judge ?? "?"}) — ${jobs}`);
     }
   }
 }
@@ -1125,10 +1249,13 @@ SUBCOMMANDS
   perf [mode]              Throughput benchmark. mode: save | compare | run | (smart).
   toolcall                 Single-turn tool-call accuracy probe (22 cases).
   multiturn                Multi-turn tool-call probe, after fabricated tool result (14 cases).
+  jobs                     Judge-scored quality probe across job roles (trading_brief,
+                           x_analysis, document_prep, hard_toolcall, reasoning).
   doctor                   Preflight audit: persistence mode, power cap, governor, KV/FA combo, etc.
-  all                      perf (smart) + toolcall + multiturn for --model.
+  all                      perf (smart) + toolcall + multiturn + jobs for --model.
   rank                     Bench --model end-to-end and (re)write its slice in the league.
   league                   Print the ranked table of every model benched on this machine.
+  routes                   Best-in-breed model per job, plus quality-per-second view.
   baseline [show]          Show baseline summary across all models (default).
   baseline clear           Delete the whole baseline file.
   baseline clear <model>   Remove just one model's entry.
@@ -1140,15 +1267,18 @@ FLAGS
   --runs <n>               per-cell runs for perf, default 3
   --out <path>             baseline file, default ./baseline.json
   --regression-pct <n>     regression threshold, default 5 (%)
-  -v, --verbose            per-case output for toolcall/multiturn
+  --judge <tag>            override the judge model for jobs (default qwen3.6:35b-a3b,
+                           auto-swap to gemma4:31b when target == judge)
+  -v, --verbose            per-case output for toolcall/multiturn/jobs
 
 EXAMPLES
   ./bench                              # smart perf run for default model
-  ./bench rank --model qwen3:30b       # add qwen3:30b to the league
+  ./bench rank --model qwen3.6:35b-a3b # add qwen3.6:35b-a3b to the league
   ./bench league                       # ranked comparison across all benched models
+  ./bench routes                       # best model per job role (judge-scored)
   ./bench doctor                       # audit GPU/host/Ollama config
   ./bench baseline show                # what's in the baseline, per model
-  ./bench baseline clear qwen3:30b     # drop one model from the league
+  ./bench baseline clear qwen3.6      # drop one model from the league
 
 Back-compat: 'save'/'compare'/'run' at top level still route to 'perf'.
 Schema: baseline.json is keyed by model (v2). v1 baselines auto-migrate on read.`);
@@ -1182,6 +1312,8 @@ async function main() {
       return spawnSibling("bench-toolcall.mjs");
     case "multiturn":
       return spawnSibling("bench-multiturn.mjs");
+    case "jobs":
+      return spawnSibling("bench-jobs.mjs");
     case "doctor":
       return spawnSibling("bench-doctor.mjs");
     case "all":
@@ -1190,6 +1322,9 @@ async function main() {
       return runRank();
     case "league":
       cmdLeague();
+      return;
+    case "routes":
+      cmdRoutes();
       return;
     case "baseline":
       return cmdBaseline(sub || "show", sub2);

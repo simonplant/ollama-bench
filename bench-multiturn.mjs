@@ -126,6 +126,37 @@ const CASES = [
       date: "2026-04-18",
     }))),
     rule: "FINAL" },
+
+  // reasoning_chain — model must read the tool result and act on what it says,
+  // not just on the user prompt. These cases push past pattern-match: the
+  // *same* prompt can produce CHAIN or FINAL depending on what the tool
+  // returned. A model that ignores the result and replays the prompt will fail.
+  { cat: "reasoning_chain",
+    prompt: "Get the AAPL quote. If it's down more than 2% today, add a task to review the position.",
+    firstTool: "quote",
+    toolResult: JSON.stringify({ symbol: "AAPL", price: 215.40, change: -7.10, changePct: -3.19, asOf: "2026-04-22T20:00Z" }),
+    // -3.19% breaches the -2% threshold → model should CHAIN to task_create
+    rule: "CHAIN:task_create" },
+  { cat: "reasoning_chain",
+    prompt: "Get the AAPL quote. If it's down more than 2% today, add a task to review the position.",
+    firstTool: "quote",
+    toolResult: JSON.stringify({ symbol: "AAPL", price: 222.80, change: 0.30, changePct: 0.13, asOf: "2026-04-22T20:00Z" }),
+    // +0.13% does NOT breach → model should synthesize and NOT chain
+    rule: "FINAL" },
+  { cat: "reasoning_chain",
+    prompt: "Read my inbox and tell me who emailed me about the board deck.",
+    firstTool: "email_inbox",
+    toolResult: JSON.stringify([
+      { id: "401", subject: "Board deck review — Friday", from: "alice@example.com", date: "2026-04-18" },
+      { id: "402", subject: "Your order has shipped", from: "shop@example.net", date: "2026-04-18" },
+      { id: "403", subject: "Re: Board deck Q3 section", from: "bob@example.com", date: "2026-04-18" },
+      { id: "404", subject: "1Password security alert", from: "hello@1password.com", date: "2026-04-17" },
+      { id: "405", subject: "Lunch?", from: "alice@example.com", date: "2026-04-16" },
+    ]),
+    // Model must filter the result to senders related to the board deck —
+    // alice and bob. Pattern-match on the prompt alone (echoing "board deck")
+    // doesn't pass; only reading the tool output does.
+    rule: "FINAL", minContent: 20 },
 ];
 
 // ── Runner ───────────────────────────────────────────────────────────────────
