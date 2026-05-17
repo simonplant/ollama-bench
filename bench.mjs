@@ -1267,7 +1267,7 @@ FLAGS
   --runs <n>               per-cell runs for perf, default 3
   --out <path>             baseline file, default ./baseline.json
   --regression-pct <n>     regression threshold, default 5 (%)
-  --judge <tag>            override the judge model for jobs (default qwen3.6:35b-a3b,
+  --judge <tag>            override the judge model for jobs (default gpt-oss:20b,
                            auto-swap to gemma4:31b when target == judge)
   -v, --verbose            per-case output for toolcall/multiturn/jobs
 

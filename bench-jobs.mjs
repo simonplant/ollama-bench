@@ -9,9 +9,8 @@
  *   - judge:         a separate model rates the response on a 0–3 rubric
  *   - caseScore = 0.5 * deterministic + 0.5 * (judge / 3), all in [0,1]
  *
- * Judge model defaults to qwen3.6:35b-a3b (strongest local). Auto-swaps to
- * gemma4:31b when the candidate IS the default judge. Override with --judge
- * or OLLAMA_BENCH_JUDGE.
+ * Judge model defaults to gpt-oss:20b. Auto-swaps to gemma4:31b when the
+ * candidate IS the default judge. Override with --judge or OLLAMA_BENCH_JUDGE.
  *
  * Two-pass execution (under OLLAMA_MAX_LOADED_MODELS=1):
  *   pass 1 — candidate generates responses for all cases (one warm load)
@@ -19,7 +18,7 @@
  *
  * Usage:
  *   node bench-jobs.mjs [--model gemma4:26b] [--host http://ollama:11434]
- *                       [--judge qwen3.6:35b-a3b] [--out ./baseline.json]
+ *                       [--judge gpt-oss:20b] [--out ./baseline.json]
  *                       [--save|--compare] [-v|--verbose]
  *
  * Per-call request timeout: 240s, override via OLLAMA_BENCH_TIMEOUT_MS.
@@ -38,7 +37,7 @@ const MODE    = args.includes("--save")    ? "save"
               : args.includes("--compare") ? "compare"
               : "smart";
 
-const JUDGE_DEFAULT  = "qwen3.6:35b-a3b";
+const JUDGE_DEFAULT  = "gpt-oss:20b";
 const JUDGE_FALLBACK = "gemma4:31b";
 const JUDGE_CLI      = arg("--judge", null);
 
