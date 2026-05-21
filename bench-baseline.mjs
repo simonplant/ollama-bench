@@ -20,6 +20,18 @@ import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from 
 
 export const SCHEMA_VERSION = 2;
 
+// Ollama treats model tags case-insensitively and quant variants
+// (`foo:1b-q4_K_M`) share a manifest with the bare tag (`foo:1b`). All probes
+// run user-supplied tags through this normalizer at parse time so equality
+// comparisons, baseline keys, and judge swaps all see the same shape.
+export function normalizeTag(t) {
+  if (t == null) return t;
+  const lower = String(t).toLowerCase();
+  const colon = lower.indexOf(":");
+  if (colon < 0) return lower;
+  return `${lower.slice(0, colon)}:${lower.slice(colon + 1).split("-")[0]}`;
+}
+
 // Read raw file, migrate v1 → v2 on the fly. Returns null if missing.
 // Migration is lossless and idempotent.
 export function read(path) {

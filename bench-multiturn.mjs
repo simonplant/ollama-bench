@@ -26,12 +26,12 @@
  */
 
 import { TOOLS } from "./bench-tools.mjs";
-import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
+import { getModelSection, writeModelSection, normalizeTag } from "./bench-baseline.mjs";
 
 const args = process.argv.slice(2);
 // lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
 const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
-const MODEL   = arg("--model", "gemma4:26b");
+const MODEL   = normalizeTag(arg("--model", "gemma4:26b"));
 const HOST    = arg("--host",  "http://ollama:11434");
 const OUT     = arg("--out",   "./baseline.json");
 const VERBOSE = args.includes("-v") || args.includes("--verbose");

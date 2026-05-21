@@ -23,6 +23,7 @@ import {
   writeModelSection,
   removeModel,
   clearAll,
+  normalizeTag,
 } from "./bench-baseline.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -63,16 +64,15 @@ function parseNonNegFloat(raw, name) {
 }
 const envFlag = name => /^(1|true|yes|on)$/i.test(process.env[name] ?? "");
 
-const MODEL     = arg("--model", "gemma4:26b");
+const MODEL     = normalizeTag(arg("--model", "gemma4:26b"));
 const HOST      = arg("--host",  "http://ollama:11434");
 const RUNS      = parsePosInt(arg("--runs", "3"), "runs");
 const OUT       = arg("--out",   "./baseline.json");
 const REG_PCT   = parseNonNegFloat(arg("--regression-pct", "5"), "regression-pct");
 
-// Concurrent-stage controls. The stage has crashed the box on VRAM-tight or
-// MoE-quirky models — `--no-concurrent` short-circuits, `--concurrent-levels`
-// forces a shape (bypasses safety), default is auto-resolved by
-// `resolveConcurrentLevels` from NUM_PARALLEL + params + post-warmup VRAM.
+// Concurrent-stage controls. `--no-concurrent` short-circuits the stage,
+// `--concurrent-levels` forces a specific shape, default is auto-resolved
+// by `resolveConcurrentLevels` from NUM_PARALLEL + params + post-warmup VRAM.
 const CONCURRENT_LEVELS_RAW = arg("--concurrent-levels", null);
 const NO_CONCURRENT = args.includes("--no-concurrent") || envFlag("OLLAMA_BENCH_NO_CONCURRENT");
 
@@ -428,10 +428,11 @@ function applyCap(levels, cap, reason, reasons) {
   return next;
 }
 
-// Decide which `parallel=N` levels to run. Stage has a history of crashing the
-// box on heavy/MoE-quirky models, so the default is adaptive (NUM_PARALLEL,
-// param count, post-warmup VRAM). Explicit `--concurrent-levels` bypasses all
-// safety; `--no-concurrent` skips the stage.
+// Decide which `parallel=N` levels to run. Default is adaptive based on
+// NUM_PARALLEL, model params, and post-warmup VRAM occupancy — keeps the
+// fan-out conservative on tight-VRAM / heavy-model configurations and
+// short-circuits when Ollama is configured to serialize.
+// Explicit `--concurrent-levels` bypasses the caps; `--no-concurrent` skips.
 function resolveConcurrentLevels({ envSnap, vramFracUsed }) {
   if (NO_CONCURRENT) return { levels: [], reasons: ["--no-concurrent / OLLAMA_BENCH_NO_CONCURRENT"] };
   if (USER_CONCURRENT_LEVELS) return { levels: USER_CONCURRENT_LEVELS, reasons: ["explicit --concurrent-levels"] };
@@ -441,8 +442,8 @@ function resolveConcurrentLevels({ envSnap, vramFracUsed }) {
 
   const np = parseInt(envSnap.ollamaServerEnv?.OLLAMA_NUM_PARALLEL ?? "", 10);
   if (Number.isFinite(np)) {
-    // NUM_PARALLEL=1 → Ollama serializes; firing 8 just queues, and the fan-
-    // out has empirically crashed heavy models. Skip the stage entirely.
+    // NUM_PARALLEL=1 → Ollama serializes; firing N concurrent requests just
+    // measures queue depth, not concurrency. Skip the stage entirely.
     if (np === 1) return { levels: [], reasons: [`OLLAMA_NUM_PARALLEL=1 (Ollama serializes; concurrent stage is metric artifact)`] };
     if (np >= 2) levels = applyCap(levels, np, `OLLAMA_NUM_PARALLEL=${np}`, reasons);
   }
@@ -1350,8 +1351,9 @@ function cmdBaseline(sub, arg) {
     if (arg) {
       // `./bench baseline clear <model>` — remove just that model entry.
       if (!existsSync(OUT)) { console.log(`no baseline at ${OUT}`); return; }
-      const removed = removeModel(OUT, arg);
-      console.log(removed ? `removed ${arg} from ${OUT}` : `${arg} not in ${OUT}`);
+      const tag = normalizeTag(arg);
+      const removed = removeModel(OUT, tag);
+      console.log(removed ? `removed ${tag} from ${OUT}` : `${tag} not in ${OUT}`);
       return;
     }
     if (!existsSync(OUT)) { console.log(`no baseline at ${OUT}`); return; }

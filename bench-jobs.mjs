@@ -25,11 +25,11 @@
  */
 
 import { TOOLS } from "./bench-tools.mjs";
-import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
+import { getModelSection, writeModelSection, normalizeTag } from "./bench-baseline.mjs";
 
 const args = process.argv.slice(2);
 const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
-const MODEL   = arg("--model", "gemma4:26b");
+const MODEL   = normalizeTag(arg("--model", "gemma4:26b"));
 const HOST    = arg("--host",  "http://ollama:11434");
 const OUT     = arg("--out",   "./baseline.json");
 const VERBOSE = args.includes("-v") || args.includes("--verbose");
@@ -39,20 +39,22 @@ const MODE    = args.includes("--save")    ? "save"
 
 const JUDGE_DEFAULT  = "gemma4:31b";
 const JUDGE_FALLBACK = "gpt-oss:20b";
-const JUDGE_CLI      = arg("--judge", null);
+const JUDGE_CLI      = normalizeTag(arg("--judge", null));
+const JUDGE_ENV      = normalizeTag(process.env.OLLAMA_BENCH_JUDGE ?? null);
 
-// When the candidate model is also the desired judge, swap to the fallback so
-// self-eval bias doesn't confound the score.
+// Swap to the fallback when the candidate IS the desired judge so the model
+// isn't asked to grade itself. All inputs are normalized at parse time, so
+// straight equality works here.
 function pickJudge(target) {
-  const desired = JUDGE_CLI || process.env.OLLAMA_BENCH_JUDGE || JUDGE_DEFAULT;
+  const desired = JUDGE_CLI || JUDGE_ENV || JUDGE_DEFAULT;
   return desired === target ? JUDGE_FALLBACK : desired;
 }
 const JUDGE = pickJudge(MODEL);
 
-// Refuse to run with a judge that isn't already pulled. Ollama auto-pulls on
-// first reference, which on this box has triggered a host-killer model just
-// by running `bench rank`. Treats `tag` and `tag-<quant>` as the same model
-// since Ollama exposes both forms in `/api/tags` for a single pull.
+// Refuse to run if the judge isn't already pulled — otherwise Ollama would
+// auto-pull on first /api/generate, which silently drags an unintended model
+// into the run. Treats `tag` and `tag-<quant>` as the same model since
+// Ollama exposes both forms in /api/tags for a single pull.
 async function assertJudgeInstalled() {
   const url = `${HOST}/api/tags`;
   const t = withTimeout(10_000);
@@ -68,8 +70,8 @@ async function assertJudgeInstalled() {
   if (!res.ok) throw new Error(`bench-jobs: ${url} returned ${res.status} — cannot verify judge`);
   const body = await res.json().catch(() => ({}));
   const tags = (body.models ?? []).map(m => m.name);
-  const matches = t => t === JUDGE || t.startsWith(`${JUDGE}-`);
-  if (!tags.some(matches)) {
+  const judgeNorm = normalizeTag(JUDGE);
+  if (!tags.some(t => normalizeTag(t) === judgeNorm)) {
     const list = tags.length ? tags.join(", ") : "(none)";
     throw new Error(
       `bench-jobs: judge model '${JUDGE}' is not pulled on ${HOST}.\n` +
