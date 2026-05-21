@@ -8,7 +8,7 @@
  *              model SQL → executed via node:sqlite → result rows compared
  *              to precomputed gold answer list (set-equality, numeric tolerant).
  *
- * Deterministic, no judge. Requires Node 22+ (built-in node:sqlite).
+ * Deterministic, no judge. Requires Node 24+ (built-in node:sqlite, stable).
  *
  * Usage:
  *   node bench-data.mjs [--model gemma4:26b] [--host http://ollama:11434]
@@ -22,6 +22,8 @@ import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -39,10 +41,10 @@ const MODE    = args.includes("--save")    ? "save"
 
 const REG_PP = 5;
 
-function genTimeoutMs() {
+function genTimeoutMs(numPredict) {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
   if (Number.isFinite(override) && override > 0) return override;
-  return 180_000;
+  return 180_000 + (numPredict || 512) * 100;
 }
 function withTimeout(ms) {
   const ac = new AbortController();
@@ -54,8 +56,8 @@ function loadJsonl(path) {
   return readFileSync(path, "utf-8").trim().split("\n").map(l => JSON.parse(l));
 }
 
-async function generate(prompt, system = null) {
-  const timeoutMs = genTimeoutMs();
+async function generate(prompt, system = null, think = false, numPredict = 512) {
+  const timeoutMs = genTimeoutMs(numPredict);
   const t = withTimeout(timeoutMs);
   let res;
   try {
@@ -67,7 +69,8 @@ async function generate(prompt, system = null) {
         ...(system ? { system } : {}),
         prompt,
         stream: false,
-        options: { temperature: 0, num_predict: 512 },
+        think,
+        options: { temperature: 0, num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -136,7 +139,7 @@ function containsValue(haystack, needle) {
   return false;
 }
 
-async function runTableQa() {
+async function runTableQa(think, numPredict) {
   let cases = loadJsonl(join(ROOT, "data", "wtq.jsonl"));
   if (LIMIT) cases = cases.slice(0, LIMIT);
 
@@ -148,7 +151,7 @@ async function runTableQa() {
     try {
       const md = renderMarkdownTable(c.header, c.rows);
       const prompt = `Table:\n${md}\n\nQuestion: ${c.question}`;
-      const response = await generate(prompt, TABLE_QA_SYSTEM);
+      const response = await generate(prompt, TABLE_QA_SYSTEM, think, numPredict);
       scored = gradeTableQa(response, c.answers);
     } catch (e) {
       scored = { pass: false, reason: `threw: ${e.message}` };
@@ -232,7 +235,7 @@ function setEqual(a, b) {
   return true;
 }
 
-async function runSqlGen() {
+async function runSqlGen(think, numPredict) {
   let cases = loadJsonl(join(ROOT, "data", "wikisql.jsonl"));
   if (LIMIT) cases = cases.slice(0, LIMIT);
 
@@ -244,7 +247,7 @@ async function runSqlGen() {
     try {
       const schema = buildSchema(c.header, c.types);
       const prompt = `Schema:\n${schema}\n\nThe table has ${c.rows.length} rows.\nQuestion: ${c.question}`;
-      const response = await generate(prompt, SQL_SYSTEM);
+      const response = await generate(prompt, SQL_SYSTEM, think, numPredict);
       const sql = extractSql(response);
       if (!sql) {
         scored = { pass: false, reason: "no SQL extracted" };
@@ -282,14 +285,18 @@ async function runSqlGen() {
 async function runAll() {
   const out = { savedAt: new Date().toISOString(), model: MODEL };
   const gpuHandle = startSampler();
-  if (CELL === "all" || CELL === "table_qa") out.table_qa = await runTableQa();
-  if (CELL === "all" || CELL === "sql_gen")  out.sql_gen  = await runSqlGen();
+  const sysHandle = startSysSampler();
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 512, 8192);
+  if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
+  if (CELL === "all" || CELL === "table_qa") out.table_qa = await runTableQa(think, numPredict);
+  if (CELL === "all" || CELL === "sql_gen")  out.sql_gen  = await runSqlGen(think, numPredict);
 
   const cells = [out.table_qa, out.sql_gen].filter(Boolean);
   out.totalCases = cells.reduce((a, c) => a + c.total, 0);
   out.totalPass  = cells.reduce((a, c) => a + c.pass,  0);
   out.dataPct    = out.totalCases ? 100 * out.totalPass / out.totalCases : null;
   out.gpu        = await stopSampler(gpuHandle);
+  out.sys        = stopSysSampler(sysHandle);
   return out;
 }
 
@@ -331,6 +338,7 @@ function printReport(current, base) {
   const baseOverall = base ? { total: base.totalCases, pass: base.totalPass, pct: base.dataPct } : null;
   console.log(cellRow("OVERALL", overall, baseOverall));
   console.log(`\n${fmtGpuSummary(current.gpu)}`);
+  console.log(fmtSysSummary(current.sys));
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────

@@ -195,7 +195,7 @@ Wrapper env vars:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `OLLAMA_BENCH_CONTAINER` | auto-detect | Sibling container (Node 20+, on Ollama's network, python3 for code probe). |
+| `OLLAMA_BENCH_CONTAINER` | auto-detect | Sibling container (Node 24+, on Ollama's network, python3 for code probe). |
 | `OLLAMA_BENCH_OLLAMA_CONTAINER` | `ollama` | Ollama container — `docker inspect`ed for `OLLAMA_*` env. |
 | `OLLAMA_BENCH_REMOTE_DIR` | `/tmp` | Writable path in the sibling for scripts + data + baseline. |
 | `OLLAMA_BENCH_MACHINE_ID` | `/etc/machine-id` | Machine fingerprint seed. |
@@ -217,7 +217,7 @@ All subcommands work identically.
 
 ## Requirements
 
-- Node 20+ (built-in `fetch`). Node 22.5+ for `bench-data.mjs` (`node:sqlite`).
+- Node 24+ (built-in `fetch` and `node:sqlite`; current active LTS).
 - An Ollama endpoint reachable from the runner.
 - `python3` on PATH (HumanEval grading).
 - Optional: `nvidia-smi`, `docker` CLI.

@@ -9,7 +9,7 @@ The user-facing usage docs live in `README.md` — read it first for CLI surface
 Two-tier execution model:
 
 1. **Host wrapper** (`bench`, bash) — runs on the box where Ollama lives. It picks a sibling container with Node + network access to the Ollama container, copies the `.mjs` files in, runs `nvidia-smi` and `docker inspect <ollama>` on the host, forwards results as `OLLAMA_BENCH_*` env vars, then invokes `node bench.mjs` inside the sibling. Baseline syncs back to the host on exit if content changed.
-2. **Node harness** (`bench.mjs` + siblings) — pure Node 20+ stdlib, no `npm install`, no build step. Runs inside whichever container the wrapper picked, or directly on the host via `node bench.mjs --host …`.
+2. **Node harness** (`bench.mjs` + siblings) — pure Node 24+ stdlib, no `npm install`, no build step. Runs inside whichever container the wrapper picked, or directly on the host via `node bench.mjs --host …`. Node 24 is the floor because `bench-data.mjs` imports the built-in `node:sqlite` module (stable as of 24, experimental + flagged in 22).
 
 Every `.mjs` is independently executable and parses its own CLI args. `bench.mjs` is the unified entry point that dispatches to subcommand modules via `spawn`, but you can also run e.g. `node bench-doctor.mjs` standalone. Only two modules are *imported* across files: `bench-baseline.mjs` (read/write/migrate the per-machine baseline) and `bench-tools.mjs` (shared tool catalogue for `toolcall` + `multiturn`). The agent probe inlines its own catalogue because its tools mutate world state.
 

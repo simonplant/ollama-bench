@@ -28,6 +28,7 @@
 import { TOOLS } from "./bench-tools.mjs";
 import { getModelSection, writeModelSection, normalizeTag } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
 
 const args = process.argv.slice(2);
 // lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
@@ -244,6 +245,7 @@ async function runCases() {
   const byCat = new Map();
   const failedPrompts = [];
   const gpuHandle = startSampler();
+  const sysHandle = startSysSampler();
   const t0 = performance.now();
   for (const c of CASES) {
     let r;
@@ -258,6 +260,7 @@ async function runCases() {
   }
   const dur = (performance.now() - t0) / 1000;
   const gpu = await stopSampler(gpuHandle);
+  const sys = stopSysSampler(sysHandle);
   const total = CASES.length;
   const pass = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
   return {
@@ -268,6 +271,7 @@ async function runCases() {
     failedPrompts,
     durationSec: dur,
     gpu,
+    sys,
   };
 }
 
@@ -309,6 +313,7 @@ function printReport(current, base) {
   const overallBase = base ? { total: base.total, pass: base.pass } : null;
   console.log(rowFor("OVERALL", { total: current.total, pass: current.pass }, overallBase));
   console.log(`\nwall: ${current.durationSec.toFixed(1)}s   ${fmtGpuSummary(current.gpu)}`);
+  console.log(fmtSysSummary(current.sys));
 
   if (hasBase) {
     const baseSet = new Set(base.failedPrompts ?? []);

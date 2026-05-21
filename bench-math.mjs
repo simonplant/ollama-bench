@@ -21,6 +21,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -38,10 +40,10 @@ const MODE    = args.includes("--save")    ? "save"
 
 const REG_PP = 5;
 
-function genTimeoutMs() {
+function genTimeoutMs(numPredict) {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
   if (Number.isFinite(override) && override > 0) return override;
-  return 240_000;
+  return 240_000 + (numPredict || 2048) * 100;
 }
 function withTimeout(ms) {
   const ac = new AbortController();
@@ -145,8 +147,8 @@ function gradeMath(response, gold) {
 }
 
 // ── Generator ────────────────────────────────────────────────────────────────
-async function generate(prompt) {
-  const timeoutMs = genTimeoutMs();
+async function generate(prompt, think, numPredict) {
+  const timeoutMs = genTimeoutMs(numPredict);
   const t = withTimeout(timeoutMs);
   let res;
   try {
@@ -157,7 +159,8 @@ async function generate(prompt) {
         model: MODEL,
         prompt,
         stream: false,
-        options: { temperature: 0, num_predict: 2048 },
+        think,
+        options: { temperature: 0, num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -173,14 +176,14 @@ async function generate(prompt) {
 }
 
 // ── Runner ───────────────────────────────────────────────────────────────────
-async function runCell(cellName, cases, gradeFn, buildPrompt) {
+async function runCell(cellName, cases, gradeFn, buildPrompt, think, numPredict) {
   const failed = [];
   const t0 = performance.now();
   let pass = 0;
   for (const c of cases) {
     let scored;
     try {
-      const response = await generate(buildPrompt(c));
+      const response = await generate(buildPrompt(c), think, numPredict);
       scored = gradeFn(response, c.gold ?? c.answer);
     } catch (e) {
       scored = { pass: false, pred: null, reason: `threw: ${e.message}` };
@@ -203,18 +206,21 @@ async function runAll() {
   const wantGsm = CELL === "all" || CELL === "gsm8k";
   const wantMath = CELL === "all" || CELL === "math500";
   const gpuHandle = startSampler();
+  const sysHandle = startSysSampler();
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 2048, 8192);
+  if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
 
   if (wantGsm) {
     let cases = loadJsonl(join(ROOT, "data", "gsm8k.jsonl"));
     if (LIMIT) cases = cases.slice(0, LIMIT);
     out.gsm8k = await runCell("gsm8k", cases, gradeGsm8k,
-      c => `${GSM8K_INSTRUCTION}\n\nProblem: ${c.question}`);
+      c => `${GSM8K_INSTRUCTION}\n\nProblem: ${c.question}`, think, numPredict);
   }
   if (wantMath) {
     let cases = loadJsonl(join(ROOT, "data", "math500.jsonl"));
     if (LIMIT) cases = cases.slice(0, LIMIT);
     out.math500 = await runCell("math500", cases, gradeMath,
-      c => `${MATH_INSTRUCTION}\n\nProblem: ${c.problem}`);
+      c => `${MATH_INSTRUCTION}\n\nProblem: ${c.problem}`, think, numPredict);
   }
 
   // Overall = case-weighted mean across cells run (so re-running with --cell
@@ -226,6 +232,7 @@ async function runAll() {
   out.totalPass  = totalPass;
   out.mathPct    = totalCases ? 100 * totalPass / totalCases : null;
   out.gpu        = await stopSampler(gpuHandle);
+  out.sys        = stopSysSampler(sysHandle);
   return out;
 }
 
@@ -267,6 +274,7 @@ function printReport(current, base) {
   const baseOverall = base ? { total: base.totalCases, pass: base.totalPass, pct: base.mathPct } : null;
   console.log(cellRow("OVERALL", overall, baseOverall));
   console.log(`\n${fmtGpuSummary(current.gpu)}`);
+  console.log(fmtSysSummary(current.sys));
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────

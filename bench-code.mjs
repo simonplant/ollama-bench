@@ -31,6 +31,8 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -47,10 +49,10 @@ const MODE    = args.includes("--save")    ? "save"
 
 const REG_PP = 5;
 
-function genTimeoutMs() {
+function genTimeoutMs(numPredict) {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
   if (Number.isFinite(override) && override > 0) return override;
-  return 240_000;
+  return 240_000 + (numPredict || 1024) * 100;
 }
 function execTimeoutMs() {
   const override = parseInt(process.env.OLLAMA_BENCH_CODE_EXEC_MS ?? "", 10);
@@ -72,8 +74,8 @@ const SYSTEM = "You are an expert Python programmer. Complete the function. " +
                "Respond with only the function body or full function definition, " +
                "no prose, no explanation.";
 
-async function generate(prompt) {
-  const timeoutMs = genTimeoutMs();
+async function generate(prompt, think, numPredict) {
+  const timeoutMs = genTimeoutMs(numPredict);
   const t = withTimeout(timeoutMs);
   let res;
   try {
@@ -85,7 +87,8 @@ async function generate(prompt) {
         system: SYSTEM,
         prompt,
         stream: false,
-        options: { temperature: 0, num_predict: 1024 },
+        think,
+        options: { temperature: 0, num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -171,14 +174,18 @@ async function runCases() {
   let cases = loadJsonl(join(ROOT, "data", "humaneval.jsonl"));
   if (LIMIT) cases = cases.slice(0, LIMIT);
 
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 1024, 8192);
+  if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
+
   const failed = [];
   const gpuHandle = startSampler();
+  const sysHandle = startSysSampler();
   const t0 = performance.now();
   let pass = 0;
   for (const c of cases) {
     let scored;
     try {
-      const response = await generate(c.prompt);
+      const response = await generate(c.prompt, think, numPredict);
       const code = extractCode(response, c.entry_point);
       const script = assembleScript(c.prompt, code, c.test, c.entry_point);
       scored = await runPython(script);
@@ -191,6 +198,7 @@ async function runCases() {
   }
   const durationSec = (performance.now() - t0) / 1000;
   const gpu = await stopSampler(gpuHandle);
+  const sys = stopSysSampler(sysHandle);
   return {
     savedAt: new Date().toISOString(),
     model: MODEL,
@@ -200,6 +208,7 @@ async function runCases() {
     failed,
     durationSec,
     gpu,
+    sys,
   };
 }
 
@@ -218,6 +227,7 @@ function printReport(current, base) {
               (base ? `  (Δ ${fmtDelta(current.codePct - base.codePct)} vs ${base.savedAt})` : "") +
               `   wall: ${current.durationSec.toFixed(1)}s`);
   console.log(fmtGpuSummary(current.gpu));
+  console.log(fmtSysSummary(current.sys));
 
   if (base) {
     const baseSet = new Set(base.failed ?? []);

@@ -31,6 +31,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
 
 const args = process.argv.slice(2);
 const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
@@ -605,6 +606,7 @@ async function runCases() {
   const byCat = new Map();
   const failedCases = [];
   const gpuHandle = startSampler();
+  const sysHandle = startSysSampler();
   const t0 = performance.now();
   for (const c of cases) {
     let scored;
@@ -620,6 +622,7 @@ async function runCases() {
   }
   const durationSec = (performance.now() - t0) / 1000;
   const gpu = await stopSampler(gpuHandle);
+  const sys = stopSysSampler(sysHandle);
   const total = cases.length;
   const pass  = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
   return {
@@ -632,6 +635,7 @@ async function runCases() {
     failed: failedCases,
     durationSec,
     gpu,
+    sys,
   };
 }
 
@@ -672,6 +676,7 @@ function printReport(current, base) {
   else overall.push(pad((totalTurns / current.total).toFixed(1), widths[4]));
   console.log(overall.join(" | "));
   console.log(`\nwall: ${current.durationSec.toFixed(1)}s` + (REAL_WEB ? "  (--real-web)" : "") + `   ${fmtGpuSummary(current.gpu)}`);
+  console.log(fmtSysSummary(current.sys));
 
   if (current.failed.length) {
     console.log("\nfailures:");

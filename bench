@@ -76,10 +76,20 @@ if [[ -z "$CONTAINER" ]] \
   elif (( ${#CANDIDATES[@]} > 1 )); then
     # Sort for deterministic output across runs (docker iterates in map order).
     mapfile -t CANDIDATES < <(printf '%s\n' "${CANDIDATES[@]}" | sort)
-    echo "multiple sibling containers on ${OLLAMA_CONTAINER}'s network with node installed:" >&2
-    printf '  %s\n' "${CANDIDATES[@]}" >&2
-    echo "set OLLAMA_BENCH_CONTAINER=<name> to disambiguate" >&2
-    exit 1
+    # Prefer a canonical runner name when present — `bench` is the
+    # purpose-built sibling; others (e.g. `hermes` serving a model) just
+    # happen to have node on PATH.
+    for preferred in bench openclaw engine-openclaw-1; do
+      for c in "${CANDIDATES[@]}"; do
+        if [[ "$c" == "$preferred" ]]; then CONTAINER="$c"; break 2; fi
+      done
+    done
+    if [[ -z "$CONTAINER" ]]; then
+      echo "multiple sibling containers on ${OLLAMA_CONTAINER}'s network with node installed:" >&2
+      printf '  %s\n' "${CANDIDATES[@]}" >&2
+      echo "set OLLAMA_BENCH_CONTAINER=<name> to disambiguate" >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -127,7 +137,7 @@ SCRIPTS=(
   bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs
   bench-math.mjs bench-code.mjs bench-knowledge.mjs bench-ifeval.mjs
   bench-data.mjs bench-agent.mjs
-  bench-doctor.mjs bench-baseline.mjs bench-gpu.mjs
+  bench-doctor.mjs bench-baseline.mjs bench-gpu.mjs bench-thinking.mjs bench-sys.mjs
 )
 # Capability probes load their case sets from data/*.jsonl, vendored in the
 # repo. Copy each file individually under data/ in the remote dir.
@@ -251,10 +261,51 @@ fi
 if [[ -n "${OLLAMA_BENCH_TIMEOUT_MS:-}" ]]; then
   EXEC_ENV+=(-e "OLLAMA_BENCH_TIMEOUT_MS=$OLLAMA_BENCH_TIMEOUT_MS")
 fi
+
+# Host-side GPU sampler — runs in parallel with the bench, captures per-second
+# nvidia-smi readings so the wrapper can print a GPU summary even when the
+# bench container has no nvidia-smi. Output kept terse: one CSV row per second.
+GPU_LOG=""
+GPU_PID=""
+if command -v nvidia-smi >/dev/null 2>&1; then
+  GPU_LOG="$(mktemp /tmp/ollama-bench-gpu-XXXXXX.log)"
+  nvidia-smi --query-gpu=memory.used,utilization.gpu,power.draw,temperature.gpu \
+             --format=csv,noheader,nounits -lms 1000 > "$GPU_LOG" 2>/dev/null &
+  GPU_PID=$!
+  # Make sure we don't leak the sampler if the wrapper is interrupted.
+  trap 'if [[ -n "$GPU_PID" ]]; then kill "$GPU_PID" 2>/dev/null || true; fi; [[ -n "$GPU_LOG" ]] && rm -f "$GPU_LOG"' EXIT INT TERM
+fi
+
 set +e
 docker exec "${EXEC_ENV[@]}" "$CONTAINER" node "$REMOTE_DIR/bench.mjs" "$@" --out "$REMOTE_BASELINE"
 EXIT=$?
 set -e
+
+# Stop the host sampler and summarise. The bench's own per-probe lines already
+# printed; the wrapper appends one host-side line so GPU is visible even when
+# the in-container sampler had no nvidia-smi.
+if [[ -n "$GPU_PID" ]]; then
+  kill "$GPU_PID" 2>/dev/null || true
+  wait "$GPU_PID" 2>/dev/null || true
+  if [[ -s "$GPU_LOG" ]]; then
+    awk -F', *' '
+      NF >= 4 {
+        n++
+        m_sum += $1; if ($1+0 > m_max) m_max = $1+0
+        u_sum += $2; if ($2+0 > u_max) u_max = $2+0
+        p_sum += $3; if ($3+0 > p_max) p_max = $3+0
+        t_sum += $4; if ($4+0 > t_max) t_max = $4+0
+      }
+      END {
+        if (n > 0) {
+          printf "host GPU avg/max (n=%d samples): vram %.0fMiB/%.0fMiB  util %.0f%%/%.0f%%  power %.1fW/%.1fW  temp %.0f°C/%.0f°C\n",
+                 n, m_sum/n, m_max, u_sum/n, u_max, p_sum/n, p_max, t_sum/n, t_max
+        }
+      }' "$GPU_LOG"
+  fi
+  rm -f "$GPU_LOG"
+  trap - EXIT INT TERM
+fi
 
 # Sync baseline state back to host only if the run actually changed it.
 # Empty POST_HASH (md5sum missing in container) is treated as "changed" so

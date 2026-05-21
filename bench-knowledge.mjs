@@ -22,6 +22,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -39,10 +41,12 @@ const MODE    = args.includes("--save")    ? "save"
 const REG_PP = 5;
 const LETTERS = "ABCDEFGHIJ";
 
-function genTimeoutMs() {
+function genTimeoutMs(numPredict) {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
   if (Number.isFinite(override) && override > 0) return override;
-  return 120_000;
+  // 120s base + 100ms per token covers thinking models that need to decode
+  // through long reasoning before reaching the visible answer.
+  return 120_000 + (numPredict || 256) * 100;
 }
 function withTimeout(ms) {
   const ac = new AbortController();
@@ -100,8 +104,8 @@ function extractLetter(text, numOptions) {
 }
 
 // ── Generator ────────────────────────────────────────────────────────────────
-async function generate(prompt) {
-  const timeoutMs = genTimeoutMs();
+async function generate(prompt, think, numPredict) {
+  const timeoutMs = genTimeoutMs(numPredict);
   const t = withTimeout(timeoutMs);
   let res;
   try {
@@ -112,9 +116,11 @@ async function generate(prompt) {
         model: MODEL,
         prompt,
         stream: false,
-        // 128 tokens is enough for "Answer: X" plus a brief justification.
-        // Some models always emit CoT even when asked not to; this caps it.
-        options: { temperature: 0, num_predict: 256 },
+        think,
+        // 256 tokens is enough for "Answer: X" plus a brief justification when
+        // thinking is off; thinking-capable models need a much larger budget
+        // so reasoning + the final letter both fit. See bench-thinking.mjs.
+        options: { temperature: 0, num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -134,14 +140,18 @@ async function runCases() {
   let cases = loadJsonl(join(ROOT, "data", "mmlupro.jsonl"));
   if (LIMIT) cases = cases.slice(0, LIMIT);
 
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 256, 8192);
+  if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
+
   const byCat = new Map();
   const failed = [];
   const gpuHandle = startSampler();
+  const sysHandle = startSysSampler();
   const t0 = performance.now();
   for (const c of cases) {
     let pred = null, pass = false, reason = "";
     try {
-      const response = await generate(buildPrompt(c));
+      const response = await generate(buildPrompt(c), think, numPredict);
       pred = extractLetter(response, c.options.length);
       if (pred == null) reason = "no letter extracted";
       else if (pred === c.answer) { pass = true; reason = "ok"; }
@@ -158,6 +168,7 @@ async function runCases() {
   }
   const durationSec = (performance.now() - t0) / 1000;
   const gpu = await stopSampler(gpuHandle);
+  const sys = stopSysSampler(sysHandle);
   const total = cases.length;
   const pass = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
   return {
@@ -169,6 +180,7 @@ async function runCases() {
     failed,
     durationSec,
     gpu,
+    sys,
   };
 }
 
@@ -208,6 +220,7 @@ function printReport(current, base) {
   if (base) overall.push(pad(fmtDelta(current.mmluPct - base.mmluPct), widths[4]));
   console.log(overall.join(" | "));
   console.log(`\nwall: ${current.durationSec.toFixed(1)}s   ${fmtGpuSummary(current.gpu)}`);
+  console.log(fmtSysSummary(current.sys));
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────

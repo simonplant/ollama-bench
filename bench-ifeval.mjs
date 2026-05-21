@@ -26,6 +26,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
+import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -42,10 +44,10 @@ const MODE    = args.includes("--save")    ? "save"
 
 const REG_PP = 5;
 
-function genTimeoutMs() {
+function genTimeoutMs(numPredict) {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
   if (Number.isFinite(override) && override > 0) return override;
-  return 240_000;
+  return 240_000 + (numPredict || 1024) * 100;
 }
 function withTimeout(ms) {
   const ac = new AbortController();
@@ -239,8 +241,8 @@ function countWords(text) {
 }
 
 // ── Generation ───────────────────────────────────────────────────────────────
-async function generate(prompt) {
-  const timeoutMs = genTimeoutMs();
+async function generate(prompt, think, numPredict) {
+  const timeoutMs = genTimeoutMs(numPredict);
   const t = withTimeout(timeoutMs);
   let res;
   try {
@@ -251,8 +253,10 @@ async function generate(prompt) {
         model: MODEL,
         prompt,
         stream: false,
-        // 1024 tokens — IFEval prompts often ask for >300 words.
-        options: { temperature: 0, num_predict: 1024 },
+        think,
+        // 1024 tokens — IFEval prompts often ask for >300 words. Thinking
+        // models need a larger budget so reasoning + answer both fit.
+        options: { temperature: 0, num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -272,15 +276,19 @@ async function runCases() {
   let cases = loadJsonl(join(ROOT, "data", "ifeval.jsonl"));
   if (LIMIT) cases = cases.slice(0, LIMIT);
 
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 1024, 8192);
+  if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
+
   const byInstr = new Map();        // instruction id → { total, pass }
   const failed = [];
   const gpuHandle = startSampler();
+  const sysHandle = startSysSampler();
   const t0 = performance.now();
   let pass = 0;
   for (const c of cases) {
     let response = "", caseOk = true, reasons = [];
     try {
-      response = await generate(c.prompt);
+      response = await generate(c.prompt, think, numPredict);
     } catch (e) {
       caseOk = false;
       reasons.push(`generate threw: ${e.message}`);
@@ -313,6 +321,7 @@ async function runCases() {
   }
   const durationSec = (performance.now() - t0) / 1000;
   const gpu = await stopSampler(gpuHandle);
+  const sys = stopSysSampler(sysHandle);
   return {
     savedAt: new Date().toISOString(),
     model: MODEL,
@@ -323,6 +332,7 @@ async function runCases() {
     failed,
     durationSec,
     gpu,
+    sys,
   };
 }
 
@@ -339,7 +349,8 @@ function printReport(current, base) {
   console.log(`\nOVERALL: ${current.pass}/${current.total} cases = ${fmtPct(current.ifevalPct)}` +
               (base ? `  (Δ ${fmtDelta(current.ifevalPct - base.ifevalPct)})` : "") +
               `   wall: ${current.durationSec.toFixed(1)}s`);
-  console.log(fmtGpuSummary(current.gpu) + "\n");
+  console.log(fmtGpuSummary(current.gpu));
+  console.log(fmtSysSummary(current.sys) + "\n");
 
   // Per-instruction pass rate. Long names; truncate the column heading.
   const cols = ["instruction", "total", "pass", "pass%"];
