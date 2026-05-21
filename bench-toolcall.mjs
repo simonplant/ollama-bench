@@ -23,6 +23,7 @@
 
 import { TOOLS } from "./bench-tools.mjs";
 import { getModelSection, writeModelSection, normalizeTag } from "./bench-baseline.mjs";
+import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
 
 const args = process.argv.slice(2);
 // lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
@@ -180,6 +181,7 @@ const caseId = c => `${c.cat}::${c.prompt}`;
 async function runCases() {
   const byCat = new Map();
   const failedPrompts = [];
+  const gpuHandle = startSampler();
   const t0 = performance.now();
   for (const c of CASES) {
     let out, scored;
@@ -198,6 +200,7 @@ async function runCases() {
     if (VERBOSE) console.log(`${scored.pass ? "✔" : "✘"} [${c.cat}] ${c.prompt.slice(0,60)}  — ${scored.reason}`);
   }
   const dur = (performance.now() - t0) / 1000;
+  const gpu = await stopSampler(gpuHandle);
   const total = CASES.length;
   const pass   = [...byCat.values()].reduce((a, r) => a + r.pass, 0);
   const schema = [...byCat.values()].reduce((a, r) => a + r.schema, 0);
@@ -208,6 +211,7 @@ async function runCases() {
     byCat: Object.fromEntries(byCat),
     failedPrompts,
     durationSec: dur,
+    gpu,
   };
 }
 
@@ -254,7 +258,7 @@ function printReport(current, base) {
   console.log("-".repeat(widths.reduce((a, w) => a + w + 3, 0)));
   const overallBase = base ? { total: base.total, pass: base.pass, schema: base.schema } : null;
   console.log(rowFor("OVERALL", { total: current.total, pass: current.pass, schema: current.schema }, overallBase));
-  console.log(`\nwall: ${current.durationSec.toFixed(1)}s`);
+  console.log(`\nwall: ${current.durationSec.toFixed(1)}s   ${fmtGpuSummary(current.gpu)}`);
 
   if (hasBase) {
     const baseSet = new Set(base.failedPrompts ?? []);

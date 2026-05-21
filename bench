@@ -119,16 +119,29 @@ fi
 REMOTE_DIR="${OLLAMA_BENCH_REMOTE_DIR:-/tmp}"
 REMOTE_BASELINE="$REMOTE_DIR/ollama-bench-baseline.json"
 
-# The unified CLI spawns the probe scripts as siblings, and both probes
-# import the shared tool catalogue, so all four files must live next to
-# each other in the container. Fail fast if any are missing on the host.
-SCRIPTS=(bench.mjs bench-toolcall.mjs bench-multiturn.mjs bench-jobs.mjs bench-tools.mjs bench-doctor.mjs bench-baseline.mjs)
+# The unified CLI spawns the probe scripts as siblings, and several modules
+# import shared helpers (bench-baseline, bench-tools), so all files must
+# live next to each other in the container. Fail fast if any are missing.
+SCRIPTS=(
+  bench.mjs
+  bench-toolcall.mjs bench-multiturn.mjs bench-tools.mjs
+  bench-math.mjs bench-code.mjs bench-knowledge.mjs bench-ifeval.mjs
+  bench-data.mjs bench-agent.mjs
+  bench-doctor.mjs bench-baseline.mjs bench-gpu.mjs
+)
+# Capability probes load their case sets from data/*.jsonl, vendored in the
+# repo. Copy each file individually under data/ in the remote dir.
+DATA_FILES=(gsm8k.jsonl math500.jsonl humaneval.jsonl mmlupro.jsonl ifeval.jsonl wtq.jsonl wikisql.jsonl)
 MISSING=()
 for script in "${SCRIPTS[@]}"; do
   [[ -f "$HERE/$script" ]] || MISSING+=("$script")
 done
+for df in "${DATA_FILES[@]}"; do
+  [[ -f "$HERE/data/$df" ]] || MISSING+=("data/$df")
+done
 if (( ${#MISSING[@]} > 0 )); then
   echo "missing harness files next to wrapper: ${MISSING[*]}" >&2
+  echo "  (regenerate data with: node scripts/fetch-data.mjs)" >&2
   exit 2
 fi
 for script in "${SCRIPTS[@]}"; do
@@ -136,6 +149,11 @@ for script in "${SCRIPTS[@]}"; do
   # variable instead of an interpolated string — robust against REMOTE_DIR
   # values that contain spaces or shell metacharacters.
   docker exec -i -e DST="$REMOTE_DIR/$script" "$CONTAINER" sh -c 'cat > "$DST"' < "$HERE/$script"
+done
+# Ensure remote data dir exists, then copy each data file in.
+docker exec -e DST="$REMOTE_DIR/data" "$CONTAINER" sh -c 'mkdir -p "$DST"'
+for df in "${DATA_FILES[@]}"; do
+  docker exec -i -e DST="$REMOTE_DIR/data/$df" "$CONTAINER" sh -c 'cat > "$DST"' < "$HERE/data/$df"
 done
 
 # Stable machine fingerprint — read the host's machine-id and pass it in.
