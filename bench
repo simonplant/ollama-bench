@@ -6,8 +6,14 @@
 #
 # Configure via environment variables:
 #   OLLAMA_BENCH_CONTAINER          sibling container name (Node 20+, network
-#                                   access to Ollama). Default: tries
-#                                   "openclaw" then "engine-openclaw-1".
+#                                   access to Ollama). When unset, the wrapper
+#                                   auto-detects: it lists every container on
+#                                   the Ollama container's docker network(s),
+#                                   removes the Ollama container itself, and
+#                                   picks the unique remaining candidate that
+#                                   has `node` on PATH. Falls back to a small
+#                                   list of known names if topology probing is
+#                                   unavailable.
 #   OLLAMA_BENCH_OLLAMA_CONTAINER   name of the Ollama container; the wrapper
 #                                   runs `docker inspect` on it to capture
 #                                   OLLAMA_* server env. Default: "ollama".
@@ -27,30 +33,72 @@
 # even when the sibling can't see them directly.
 #
 # Usage: same as `node bench.mjs`. Passes all arguments through.
-#   ./bench                          # smart perf run for current --model
-#   ./bench rank --model qwen3:30b   # add or refresh a model in the league
-#   ./bench league                   # ranked table across all benched models
-#   ./bench doctor                   # preflight system audit
-#   ./bench --help                   # full CLI
+#   ./bench                            # smart perf run for current --model
+#   ./bench rank --model nemotron3:33b # add or refresh a model in the league
+#   ./bench league                     # ranked table across all benched models
+#   ./bench doctor                     # preflight system audit
+#   ./bench --help                     # full CLI
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BASELINE_HOST="$HERE/baseline.json"
 
+OLLAMA_CONTAINER="${OLLAMA_BENCH_OLLAMA_CONTAINER:-ollama}"
 CONTAINER="${OLLAMA_BENCH_CONTAINER:-}"
+
+# Helper: does $1 name a running container that has `node` on PATH?
+container_has_node() {
+  docker exec "$1" sh -c 'command -v node >/dev/null 2>&1' >/dev/null 2>&1
+}
+
+# Topology-based detection: any sibling on the Ollama container's network with
+# Node on PATH is a valid runner. This works regardless of naming (bench,
+# openclaw, foo-runner-1) and survives container renames.
+if [[ -z "$CONTAINER" ]] \
+  && docker ps --filter "name=^${OLLAMA_CONTAINER}$" --format '{{.Names}}' 2>/dev/null \
+     | grep -qx "$OLLAMA_CONTAINER"; then
+  declare -A SEEN=()
+  CANDIDATES=()
+  while IFS= read -r net; do
+    [[ -z "$net" ]] && continue
+    while IFS= read -r name; do
+      [[ -z "$name" ]] && continue
+      [[ "$name" == "$OLLAMA_CONTAINER" ]] && continue
+      [[ -n "${SEEN[$name]:-}" ]] && continue
+      SEEN[$name]=1
+      # Must be running (network inspect can list stopped containers too).
+      docker ps --filter "name=^${name}$" --format '{{.Names}}' \
+        | grep -qx "$name" || continue
+      container_has_node "$name" || continue
+      CANDIDATES+=("$name")
+    done < <(docker network inspect "$net" --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}' 2>/dev/null)
+  done < <(docker inspect "$OLLAMA_CONTAINER" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null)
+
+  if (( ${#CANDIDATES[@]} == 1 )); then
+    CONTAINER="${CANDIDATES[0]}"
+  elif (( ${#CANDIDATES[@]} > 1 )); then
+    echo "multiple sibling containers on ${OLLAMA_CONTAINER}'s network with node installed:" >&2
+    printf '  %s\n' "${CANDIDATES[@]}" >&2
+    echo "set OLLAMA_BENCH_CONTAINER=<name> to disambiguate" >&2
+    exit 1
+  fi
+fi
+
+# Known-name fallback — used when topology probing turned up nothing (e.g. the
+# Ollama container isn't running, or docker network inspect isn't permitted).
 if [[ -z "$CONTAINER" ]]; then
-  for candidate in openclaw engine-openclaw-1; do
+  for candidate in bench openclaw engine-openclaw-1; do
     if docker ps --filter "name=^${candidate}$" --format '{{.Names}}' | grep -qx "$candidate"; then
       CONTAINER="$candidate"; break
     fi
   done
 fi
-# Prefix fallback — matches openclaw-<hash>, engine-openclaw-*, etc. Ambiguity
-# (multiple running containers under the same prefix) is a user decision, so
-# bail out rather than silently picking one.
+# Prefix fallback — matches openclaw-<hash>, engine-openclaw-*, bench-*, etc.
+# Ambiguity (multiple running containers under the same prefix) is a user
+# decision, so bail out rather than silently picking one.
 if [[ -z "$CONTAINER" ]]; then
-  for prefix in openclaw engine-openclaw; do
+  for prefix in bench openclaw engine-openclaw; do
     mapfile -t matches < <(docker ps --filter "name=^${prefix}" --format '{{.Names}}')
     if (( ${#matches[@]} == 1 )); then
       CONTAINER="${matches[0]}"; break
@@ -120,8 +168,14 @@ HOST_SWAP=""
 if command -v free >/dev/null 2>&1; then
   HOST_SWAP=$(free -m | awk '/^Swap:/ {print $2, $3}' 2>/dev/null || true)
 fi
+# Modern systems keep the driver resident via the nvidia-persistenced daemon
+# rather than the deprecated `nvidia-smi -pm 1` flag, so nvidia-smi still
+# reports persistence_mode=Disabled. Capture daemon state separately.
+HOST_PERSISTENCED=""
+if command -v systemctl >/dev/null 2>&1; then
+  HOST_PERSISTENCED=$(systemctl is-active nvidia-persistenced 2>/dev/null || true)
+fi
 
-OLLAMA_CONTAINER="${OLLAMA_BENCH_OLLAMA_CONTAINER:-ollama}"
 HOST_OLLAMA_ENV=""
 if docker ps --filter "name=^${OLLAMA_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -qx "$OLLAMA_CONTAINER"; then
   HOST_OLLAMA_ENV=$(docker inspect "$OLLAMA_CONTAINER" --format '{{json .Config.Env}}' 2>/dev/null) || HOST_OLLAMA_ENV=""
@@ -166,6 +220,10 @@ fi
 if [[ -n "$HOST_SWAP" ]]; then
   export OLLAMA_BENCH_SWAP="$HOST_SWAP"
   EXEC_ENV+=(-e OLLAMA_BENCH_SWAP)
+fi
+if [[ -n "$HOST_PERSISTENCED" ]]; then
+  export OLLAMA_BENCH_PERSISTENCED="$HOST_PERSISTENCED"
+  EXEC_ENV+=(-e OLLAMA_BENCH_PERSISTENCED)
 fi
 set +e
 docker exec "${EXEC_ENV[@]}" "$CONTAINER" node "$REMOTE_DIR/bench.mjs" "$@" --out "$REMOTE_BASELINE"

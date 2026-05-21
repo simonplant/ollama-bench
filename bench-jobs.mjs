@@ -9,9 +9,11 @@
  *   - judge:         a separate model rates the response on a 0–3 rubric
  *   - caseScore = 0.5 * deterministic + 0.5 * (judge / 3), all in [0,1]
  *
- * Judge model defaults to qwen3.6:35b-a3b (strongest local). Auto-swaps to
- * gemma4:31b when the candidate IS the default judge. Override with --judge
- * or OLLAMA_BENCH_JUDGE.
+ * Judge model defaults to gemma4:31b. Auto-swaps to gpt-oss:20b when the
+ * candidate IS the default judge (so the model isn't asked to grade itself).
+ * Override with --judge or OLLAMA_BENCH_JUDGE. The judge tag must already
+ * appear in `ollama list` — the probe refuses to let Ollama auto-pull a
+ * missing judge, which on this box has triggered host-killer model loads.
  *
  * Two-pass execution (under OLLAMA_MAX_LOADED_MODELS=1):
  *   pass 1 — candidate generates responses for all cases (one warm load)
@@ -19,7 +21,7 @@
  *
  * Usage:
  *   node bench-jobs.mjs [--model gemma4:26b] [--host http://ollama:11434]
- *                       [--judge qwen3.6:35b-a3b] [--out ./baseline.json]
+ *                       [--judge gemma4:31b] [--out ./baseline.json]
  *                       [--save|--compare] [-v|--verbose]
  *
  * Per-call request timeout: 240s, override via OLLAMA_BENCH_TIMEOUT_MS.
@@ -38,8 +40,8 @@ const MODE    = args.includes("--save")    ? "save"
               : args.includes("--compare") ? "compare"
               : "smart";
 
-const JUDGE_DEFAULT  = "qwen3.6:35b-a3b";
-const JUDGE_FALLBACK = "gemma4:31b";
+const JUDGE_DEFAULT  = "gemma4:31b";
+const JUDGE_FALLBACK = "gpt-oss:20b";
 const JUDGE_CLI      = arg("--judge", null);
 
 // When the candidate model is also the desired judge, swap to the fallback so
@@ -49,6 +51,38 @@ function pickJudge(target) {
   return desired === target ? JUDGE_FALLBACK : desired;
 }
 const JUDGE = pickJudge(MODEL);
+
+// Refuse to run with a judge that isn't already pulled. Ollama auto-pulls on
+// first reference, which on this box has triggered a host-killer model just
+// by running `bench rank`. Treats `tag` and `tag-<quant>` as the same model
+// since Ollama exposes both forms in `/api/tags` for a single pull.
+async function assertJudgeInstalled() {
+  const url = `${HOST}/api/tags`;
+  const t = withTimeout(10_000);
+  let res;
+  try {
+    res = await fetch(url, { signal: t.signal });
+  } catch (e) {
+    t.cancel();
+    if (e.name === "AbortError") throw new Error(`bench-jobs: ${url} timed out after 10s — is Ollama up?`);
+    throw new Error(`bench-jobs: could not reach ${url} to verify judge: ${e.message}`);
+  } finally {
+    t.cancel();
+  }
+  if (!res.ok) throw new Error(`bench-jobs: ${url} returned ${res.status} — cannot verify judge`);
+  const body = await res.json().catch(() => ({}));
+  const tags = (body.models ?? []).map(m => m.name);
+  const matches = t => t === JUDGE || t.startsWith(`${JUDGE}-`);
+  if (!tags.some(matches)) {
+    const list = tags.length ? tags.join(", ") : "(none)";
+    throw new Error(
+      `bench-jobs: judge model '${JUDGE}' is not pulled on ${HOST}.\n` +
+      `  installed: ${list}\n` +
+      `  fix: 'ollama pull ${JUDGE}' (only if you've verified it's safe on this box),\n` +
+      `       or pass --judge <installed-model> / set OLLAMA_BENCH_JUDGE=<installed-model>.`
+    );
+  }
+}
 
 function chatTimeoutMs() {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
@@ -1048,6 +1082,7 @@ function printReport(current, base) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log(`\nbench-jobs: model=${MODEL} judge=${JUDGE} host=${HOST} cases=${CASES.length}\n`);
+  await assertJudgeInstalled();
 
   const existing = getModelSection(OUT, MODEL, "jobs");
   let mode = MODE;

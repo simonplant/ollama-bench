@@ -75,9 +75,19 @@ function checkGpu() {
   if (/^Enabled$/i.test(persistence)) {
     ok("gpu", "persistence mode", "enabled");
   } else {
-    warn("gpu", "persistence mode",
-      `"${persistence}" — driver unloads between idle periods, adding ~1–3s to first request`,
-      "sudo nvidia-smi -pm 1");
+    // nvidia-smi reports `Disabled` even when the modern nvidia-persistenced
+    // daemon keeps the driver resident — same effect, different mechanism.
+    // The wrapper injects daemon state; fall back to a local probe if absent.
+    const daemon = process.env.OLLAMA_BENCH_PERSISTENCED
+      || tryExec("systemctl is-active nvidia-persistenced 2>/dev/null")
+      || "";
+    if (/^active$/i.test(daemon.trim())) {
+      ok("gpu", "persistence mode", "nvidia-persistenced daemon active");
+    } else {
+      warn("gpu", "persistence mode",
+        `"${persistence}" — driver unloads between idle periods, adding ~1–3s to first request`,
+        "sudo systemctl enable --now nvidia-persistenced");
+    }
   }
 
   const pdef = parseFloat(powerDefault), pmax = parseFloat(powerMax);

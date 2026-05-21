@@ -43,6 +43,8 @@ Flags (any order, any subcommand):
 - `--runs <n>` — per-cell runs for perf, default 3
 - `--out <path>` — baseline file, default `./baseline.json`
 - `--regression-pct <n>` — regression threshold in %, default 5
+- `--concurrent-levels <csv>` — override the parallel=N levels in stage 3 (e.g. `--concurrent-levels 1,2,4`). Default is auto-resolved (see below).
+- `--no-concurrent` — skip stage 3 entirely. Equivalent to `OLLAMA_BENCH_NO_CONCURRENT=1`.
 - `-v` / `--verbose` — per-case output for toolcall / multiturn
 - `OLLAMA_BENCH_TIMEOUT_MS` — env override for per-call request timeout
 
@@ -52,7 +54,7 @@ Four dimensions, each chosen because it isolates a class of regression:
 
 1. **Single-stream generation** at three prompt sizes (short / medium / long ≈ 200 / 2K / 8K tokens) plus a long-gen cell (short prompt, 1024 output tokens). Median over N runs. Reports prompt t/s, gen t/s, TTFT (time to first decoded token), and total wall ms. Every call starts with a per-process nonce so the prompt prefix differs from any other call — defeats llama.cpp's prefix cache so prompt-eval reflects real compute.
 2. **Cold start.** Forces eviction with `keep_alive: "0s"`, then measures load duration, full-reply wall time, and TTFT for the next request. Median over 3 cycles.
-3. **Concurrency.** 1 / 2 / 4 / 8 parallel streams at a medium prompt × 64-token gen. Three per-row metrics: `e2e t/s` (end-to-end wall throughput, what a caller experiences), `decode t/s` (aggregate pure-decoder, isolates batcher scaling from prompt-eval), `per-stream t/s` (median per-request).
+3. **Concurrency.** Up to 1 / 2 / 4 / 8 parallel streams at a medium prompt × 64-token gen. Three per-row metrics: `e2e t/s` (end-to-end wall throughput, what a caller experiences), `decode t/s` (aggregate pure-decoder, isolates batcher scaling from prompt-eval), `per-stream t/s` (median per-request). Levels are **auto-capped** to keep heavy/MoE models from blowing past VRAM: serialized servers (`OLLAMA_NUM_PARALLEL=1`) skip the stage entirely, large models drop high-N levels (≥30B → max n=4, ≥45B → n=2, ≥65B → skipped), and ≥85% post-warmup VRAM occupancy tightens the cap further. Pass `--concurrent-levels` to override or `--no-concurrent` to skip.
 4. **Environment snapshot.** Ollama version, model digest + quant, GPU state (name, driver, VRAM, util, temp, power, SM clock), and the Ollama server's `OLLAMA_*` env vars. Stored alongside the numbers so a regression run diffs *what changed* alongside *how it changed*.
 
 Compare mode flags any cell more than 5% worse than baseline with ⚠. Baselines include per-cell noise floors (2σ); the effective threshold is `max(--regression-pct, 2× cv%)`. An `[environment changes vs baseline]` block lists scalar deltas (Ollama version, GPU driver, `OLLAMA_NUM_PARALLEL`, etc.).
@@ -145,8 +147,8 @@ If Ollama is reachable from the host directly (native install, or a container wi
 
 ```bash
 node bench.mjs --host http://localhost:11434
-node bench.mjs rank --model qwen3:30b --host http://localhost:11434
-node bench.mjs toolcall --model qwen3:30b -v --host http://localhost:11434
+node bench.mjs rank --model nemotron3:33b --host http://localhost:11434
+node bench.mjs toolcall --model nemotron3:33b -v --host http://localhost:11434
 ```
 
 Every subcommand and flag works the same. Without the wrapper you lose the host-injected env (GPU CSV, server env, CPU governor) — the harness falls back to its own probes, which work on a bare-metal host.

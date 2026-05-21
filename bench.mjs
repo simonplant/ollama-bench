@@ -28,6 +28,10 @@
  *   --runs <n>                per-cell runs, default 3 (perf only)
  *   --out <path>              baseline file, default ./baseline.json
  *   --regression-pct <n>      flag threshold, default 5 (perf only)
+ *   --concurrent-levels <csv> override the parallel=N levels for stage 3
+ *                             (e.g. 1,2,4). Default is auto-resolved from
+ *                             NUM_PARALLEL + model params + VRAM headroom.
+ *   --no-concurrent           skip stage 3 entirely (or OLLAMA_BENCH_NO_CONCURRENT=1).
  *   -v, --verbose             per-case output (toolcall/multiturn)
  *
  * Baseline is per-machine, keyed by model (schema v2). Older flat-shaped
@@ -59,7 +63,7 @@ const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i +
 
 // Flags that consume the next argv entry as their value. Anything else
 // starting with `-` is a boolean; anything else is positional.
-const VALUE_FLAGS = new Set(["--model", "--host", "--runs", "--out", "--regression-pct", "--judge"]);
+const VALUE_FLAGS = new Set(["--model", "--host", "--runs", "--out", "--regression-pct", "--judge", "--concurrent-levels"]);
 function parseArgs(argv) {
   const flags = [], positional = [];
   for (let i = 0; i < argv.length; i++) {
@@ -85,12 +89,37 @@ function parseNonNegFloat(raw, name) {
   if (!Number.isFinite(n) || n < 0) { console.error(`invalid --${name}: ${raw} (expected non-negative number)`); process.exit(2); }
   return n;
 }
+const envFlag = name => /^(1|true|yes|on)$/i.test(process.env[name] ?? "");
 
 const MODEL     = arg("--model", "gemma4:26b");
 const HOST      = arg("--host",  "http://ollama:11434");
 const RUNS      = parsePosInt(arg("--runs", "3"), "runs");
 const OUT       = arg("--out",   "./baseline.json");
 const REG_PCT   = parseNonNegFloat(arg("--regression-pct", "5"), "regression-pct");
+
+// Concurrent-stage controls. The stage has crashed the box on VRAM-tight or
+// MoE-quirky models — `--no-concurrent` short-circuits, `--concurrent-levels`
+// forces a shape (bypasses safety), default is auto-resolved by
+// `resolveConcurrentLevels` from NUM_PARALLEL + params + post-warmup VRAM.
+const CONCURRENT_LEVELS_RAW = arg("--concurrent-levels", null);
+const NO_CONCURRENT = args.includes("--no-concurrent") || envFlag("OLLAMA_BENCH_NO_CONCURRENT");
+
+function parseLevelsCsv(raw) {
+  const parts = raw.split(",").map(s => s.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    console.error(`invalid --concurrent-levels: ${raw} (expected comma-separated positive integers)`);
+    process.exit(2);
+  }
+  return parts.map(s => parsePosInt(s, "concurrent-levels"));
+}
+const USER_CONCURRENT_LEVELS = CONCURRENT_LEVELS_RAW ? parseLevelsCsv(CONCURRENT_LEVELS_RAW) : null;
+
+// Thinking models (qwen3, deepseek-r1, gpt-oss) emit reasoning tokens into a
+// separate `thinking` field that burns through `num_predict` before any user-
+// visible `response` arrives. We disable thinking by default so throughput is
+// comparable across families and short-budget cells produce a real response.
+// Set OLLAMA_BENCH_THINK=1 to measure reasoning-mode throughput instead.
+const WANT_THINK = envFlag("OLLAMA_BENCH_THINK");
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 // Deterministic seed so "fresh prefix per run" is still reproducible across
@@ -182,6 +211,7 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
     model: MODEL,
     prompt,
     stream: true,
+    think: WANT_THINK,
     options: { num_predict: numPredict, temperature: 0, seed: 42 },
   };
   if (keepAlive !== undefined) body.keep_alive = keepAlive;
@@ -222,10 +252,11 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
         buf = buf.slice(nl + 1);
         if (!line) continue;
         const j = JSON.parse(line);
-        // TTFT = wall time until first chunk with a non-empty decoded token.
-        // Prompt-eval happens before this fires, so TTFT includes prompt
-        // processing — which is what an interactive user actually feels.
-        if (firstTokenMs === null && j.response && j.response.length > 0) {
+        // TTFT counts the first decoded token of any kind; thinking chunks
+        // arrive before `response` ones for reasoning models and are what an
+        // interactive user actually feels even when clients hide them.
+        const tok = j.response || j.thinking;
+        if (firstTokenMs === null && tok?.length > 0) {
           firstTokenMs = performance.now() - t0;
         }
         if (j.done) final = j;
@@ -344,6 +375,92 @@ async function scenarioColdStart() {
     firstTokenMs: ttfts.length > 0 ? median(ttfts) : null,
     genTps: median(tpss),
   };
+}
+
+// "49B" → 49, "70.5B" → 70.5, "3b" → 3, null/unknown → null.
+// Ollama's /api/show reports params as a human string in details.parameter_size;
+// we use it as a rough size proxy for safety capping the concurrent stage.
+function parseParamsB(s) {
+  if (!s) return null;
+  const m = String(s).match(/([\d.]+)\s*[Bb]/);
+  if (!m) return null;
+  const v = parseFloat(m[1]);
+  return Number.isFinite(v) ? v : null;
+}
+
+// Post-warmup VRAM occupancy as a fraction of total. Prefers Ollama's own view
+// (`/api/ps` reports `size_vram` per loaded model) because the harness usually
+// runs inside a sibling container without nvidia-smi. Falls back to nvidia-smi
+// when reachable. Returns null if neither path produces a usable number.
+async function probeVramFracUsed(envSnap) {
+  const totalMiB = envSnap.gpu?.[0]?.memTotalMiB;
+  if (!totalMiB || totalMiB <= 0) return null;
+  const r = await fetchMeta(`${HOST}/api/ps`);
+  if (r) {
+    try {
+      const j = await r.json();
+      const vramBytes = (j.models ?? []).reduce((a, m) => a + (m.size_vram ?? 0), 0);
+      if (vramBytes > 0) return (vramBytes / (1024 * 1024)) / totalMiB;
+    } catch { /* fall through */ }
+  }
+  const fresh = tryExec("nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits");
+  if (fresh) {
+    const used = parseInt(fresh.split("\n")[0], 10);
+    if (Number.isFinite(used) && used >= 0) return used / totalMiB;
+  }
+  return null;
+}
+
+// Pick the first cap whose threshold the value clears. `thresholds` must be
+// descending in `min`, e.g. [[65,1],[45,2],[30,4]] → "≥65B cap 1, ≥45B cap 2…".
+function thresholdCap(value, thresholds) {
+  for (const [min, cap] of thresholds) if (value >= min) return cap;
+  return Infinity;
+}
+// Filter `levels` down by `cap`; record `reason` only when the cap actually
+// removed something (non-binding caps would otherwise litter the reasons log).
+function applyCap(levels, cap, reason, reasons) {
+  if (!Number.isFinite(cap)) return levels;
+  const next = levels.filter(n => n <= cap);
+  if (next.length < levels.length) reasons.push(reason);
+  return next;
+}
+
+// Decide which `parallel=N` levels to run. Stage has a history of crashing the
+// box on heavy/MoE-quirky models, so the default is adaptive (NUM_PARALLEL,
+// param count, post-warmup VRAM). Explicit `--concurrent-levels` bypasses all
+// safety; `--no-concurrent` skips the stage.
+function resolveConcurrentLevels({ envSnap, vramFracUsed }) {
+  if (NO_CONCURRENT) return { levels: [], reasons: ["--no-concurrent / OLLAMA_BENCH_NO_CONCURRENT"] };
+  if (USER_CONCURRENT_LEVELS) return { levels: USER_CONCURRENT_LEVELS, reasons: ["explicit --concurrent-levels"] };
+
+  let levels = [1, 2, 4, 8];
+  const reasons = [];
+
+  const np = parseInt(envSnap.ollamaServerEnv?.OLLAMA_NUM_PARALLEL ?? "", 10);
+  if (Number.isFinite(np)) {
+    // NUM_PARALLEL=1 → Ollama serializes; firing 8 just queues, and the fan-
+    // out has empirically crashed heavy models. Skip the stage entirely.
+    if (np === 1) return { levels: [], reasons: [`OLLAMA_NUM_PARALLEL=1 (Ollama serializes; concurrent stage is metric artifact)`] };
+    if (np >= 2) levels = applyCap(levels, np, `OLLAMA_NUM_PARALLEL=${np}`, reasons);
+  }
+
+  const paramsB = parseParamsB(envSnap.modelParams);
+  if (paramsB != null) {
+    levels = applyCap(levels, thresholdCap(paramsB, [[65, 1], [45, 2], [30, 4]]), `model params=${paramsB}B`, reasons);
+  }
+
+  if (vramFracUsed != null) {
+    levels = applyCap(levels, thresholdCap(vramFracUsed, [[0.95, 1], [0.85, 2], [0.75, 4]]), `VRAM ${(vramFracUsed * 100).toFixed(0)}% used post-warmup`, reasons);
+  }
+
+  // n=1 alone duplicates the medium singleStream cell — no scaling info.
+  if (levels.length === 1 && levels[0] === 1) {
+    reasons.push(`only n=1 survived caps`);
+    return { levels: [], reasons };
+  }
+
+  return { levels, reasons };
 }
 
 async function scenarioConcurrent(isSave, levels = [1, 2, 4, 8]) {
@@ -636,8 +753,9 @@ function collectRegressions(cur, base) {
 function printHeadline(cur, envSnap) {
   const short = cur.singleStream.find(r => r.ctx === "short") ?? cur.singleStream[0];
   const longGen = cur.singleStream.find(r => r.ctx === "long-gen") ?? short;
-  const n1 = cur.concurrent.find(r => r.parallel === 1);
-  const nMax = cur.concurrent[cur.concurrent.length - 1];
+  const concurrent = cur.concurrent ?? [];
+  const n1 = concurrent.find(r => r.parallel === 1);
+  const nMax = concurrent[concurrent.length - 1];
   const np = envSnap?.ollamaServerEnv?.OLLAMA_NUM_PARALLEL;
   const serialized = np === "1" || np == null;
 
@@ -656,6 +774,8 @@ function printHeadline(cur, envSnap) {
     console.log("  " + label("Concurrency") + col.yellow("serialized") + col.dim(`  NUM_PARALLEL=${np ?? "unset"} — ${nMax.parallel} callers share ~${fmtFloat(nMax.e2eGenTps, 0)} tok/s (≈${fmtFloat(perCallerAvg, 0)} each)`));
   } else if (nMax) {
     console.log("  " + label("Concurrency") + col.green("parallel") + col.dim(`  NUM_PARALLEL=${np} — ${nMax.parallel} callers total ${fmtFloat(nMax.e2eGenTps, 0)} tok/s`));
+  } else {
+    console.log("  " + label("Concurrency") + col.dim("skipped") + col.dim(`  NUM_PARALLEL=${np ?? "unset"} — concurrent stage not run`));
   }
 }
 
@@ -714,6 +834,10 @@ function printColdStart(cur, base) {
 }
 
 function printConcurrent(cur, base, envSnap) {
+  if (!Array.isArray(cur) || cur.length === 0) {
+    console.log("\n" + col.bold("[concurrent streams]") + col.dim("   skipped (see [3/3] log above for reason)"));
+    return;
+  }
   console.log("\n" + col.bold("[concurrent streams]") + col.dim("   e2e = total tokens ÷ wall; decode = aggregate pure-decode"));
   const columns = [
     { label: "parallel",       align: "r" },
@@ -839,8 +963,12 @@ function validateBaselineShape(b) {
     }
   }
 
+  // `concurrent` is allowed to be an empty array — the stage is now
+  // auto-skipped for serialized servers, oversized models, and high-VRAM
+  // pressure cases (see resolveConcurrentLevels). If present, every row must
+  // have finite metrics.
   const co = b?.concurrent;
-  if (!Array.isArray(co) || co.length === 0) errs.push("concurrent empty");
+  if (!Array.isArray(co)) errs.push("concurrent missing");
   else for (const r of co) {
     for (const k of ["e2eGenTps", "decodeGenTps", "perStreamGenTps"]) {
       if (!finite(r?.[k])) errs.push(`concurrent[n=${r?.parallel}].${k} not finite (${r?.[k]})`);
@@ -890,8 +1018,21 @@ async function runPerf(mode) {
   const singleStream = await scenarioSingleStream(isSave);
   console.log(`[2/3] cold-start (${COLD_START_CYCLES} cycles)…`);
   const coldStart = await scenarioColdStart();
-  console.log("[3/3] concurrent streams…");
-  const concurrent = await scenarioConcurrent(isSave);
+
+  // Resolve concurrent stage shape from current context (NUM_PARALLEL, model
+  // params, post-warmup VRAM). This is where we previously blew up the box on
+  // heavy models — see `resolveConcurrentLevels` for the policy.
+  const vramFracUsed = await probeVramFracUsed(envSnap);
+  const { levels: concurrentLevels, reasons: concurrentReasons } = resolveConcurrentLevels({ envSnap, vramFracUsed });
+  let concurrent = [];
+  if (concurrentLevels.length === 0) {
+    const why = concurrentReasons.length ? ` (${concurrentReasons.join("; ")})` : "";
+    console.log(`[3/3] concurrent streams — skipped${why}`);
+  } else {
+    const why = concurrentReasons.length ? ` (${concurrentReasons.join("; ")})` : "";
+    console.log(`[3/3] concurrent streams: levels=[${concurrentLevels.join(",")}]${why}`);
+    concurrent = await scenarioConcurrent(isSave, concurrentLevels);
+  }
 
   const current = { env: envSnap, singleStream, coldStart, concurrent };
 
@@ -1267,18 +1408,25 @@ FLAGS
   --runs <n>               per-cell runs for perf, default 3
   --out <path>             baseline file, default ./baseline.json
   --regression-pct <n>     regression threshold, default 5 (%)
-  --judge <tag>            override the judge model for jobs (default qwen3.6:35b-a3b,
-                           auto-swap to gemma4:31b when target == judge)
+  --concurrent-levels CSV  override parallel=N levels for the concurrent stage
+                           (e.g. --concurrent-levels 1,2,4). Default auto-caps
+                           by OLLAMA_NUM_PARALLEL, model params, and VRAM use.
+  --no-concurrent          skip the concurrent stage entirely. Equivalent to
+                           OLLAMA_BENCH_NO_CONCURRENT=1.
+  --judge <tag>            override the judge model for jobs (default gemma4:31b,
+                           auto-swap to gpt-oss:20b when target == judge).
+                           The probe refuses to pull a missing judge — pass a
+                           tag that already appears in 'ollama list'.
   -v, --verbose            per-case output for toolcall/multiturn/jobs
 
 EXAMPLES
   ./bench                              # smart perf run for default model
-  ./bench rank --model qwen3.6:35b-a3b # add qwen3.6:35b-a3b to the league
+  ./bench rank --model nemotron3:33b   # add nemotron3:33b to the league
   ./bench league                       # ranked comparison across all benched models
   ./bench routes                       # best model per job role (judge-scored)
   ./bench doctor                       # audit GPU/host/Ollama config
   ./bench baseline show                # what's in the baseline, per model
-  ./bench baseline clear qwen3.6      # drop one model from the league
+  ./bench baseline clear nemotron3     # drop one model from the league
 
 Back-compat: 'save'/'compare'/'run' at top level still route to 'perf'.
 Schema: baseline.json is keyed by model (v2). v1 baselines auto-migrate on read.`);
