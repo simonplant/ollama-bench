@@ -63,7 +63,6 @@ async function assertJudgeInstalled() {
   try {
     res = await fetch(url, { signal: t.signal });
   } catch (e) {
-    t.cancel();
     if (e.name === "AbortError") throw new Error(`bench-jobs: ${url} timed out after 10s — is Ollama up?`);
     throw new Error(`bench-jobs: could not reach ${url} to verify judge: ${e.message}`);
   } finally {
@@ -313,7 +312,8 @@ function num(v) {
 
 function near(actual, expected, tolPct = 10) {
   const a = num(actual);
-  if (!Number.isFinite(a) || expected === 0) return Number.isFinite(a) && actual === expected ? 1 : 0;
+  if (!Number.isFinite(a)) return 0;
+  if (expected === 0) return a === 0 ? 1 : 0;
   const pct = Math.abs(a - expected) / Math.abs(expected) * 100;
   return pct <= tolPct ? 1 : 0;
 }
@@ -874,10 +874,9 @@ Reply with ONLY a JSON object — no prose, no fenced code. Schema:
 async function generate(model, prompt, { tools, timeoutMs } = {}) {
   const ms = timeoutMs ?? chatTimeoutMs();
   const t = withTimeout(ms);
-  const body = tools
-    ? { model, messages: [{ role: "user", content: prompt }], tools, temperature: 0 }
-    : { model, messages: [{ role: "user", content: prompt }], temperature: 0 };
-  const endpoint = tools ? "/v1/chat/completions" : "/v1/chat/completions";
+  const body = { model, messages: [{ role: "user", content: prompt }], temperature: 0 };
+  if (tools) body.tools = tools;
+  const endpoint = "/v1/chat/completions";
   let res;
   try {
     res = await fetch(`${HOST}${endpoint}`, {

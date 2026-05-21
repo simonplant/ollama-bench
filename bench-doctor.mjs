@@ -104,14 +104,15 @@ function checkGpu() {
 
   const throttle = parseInt(throttleHex || "0", 16);
   if (!isNaN(throttle)) {
-    // NVML bits: 0x8=hw_slowdown, 0x40=hw_thermal, 0x80=hw_power_brake.
-    // Idle/app-clock bits (0x1, 0x2) are normal at rest — don't flag them.
-    const hw = throttle & 0xC8;
+    // NVML bits: 0x8=hw_slowdown, 0x20=sw_thermal_slowdown, 0x40=hw_thermal,
+    // 0x80=hw_power_brake. Idle/app-clock bits (0x1, 0x2) are normal at rest.
+    // sw_thermal_slowdown is a real driver-clamped thermal event, not noise.
+    const hw = throttle & 0xE8;
     if (hw) {
       fail("gpu", "throttle state",
-        `hardware throttle active (mask 0x${hw.toString(16)}): check cooling, PSU, power limit`);
+        `throttle active (mask 0x${hw.toString(16)}): check cooling, PSU, power limit`);
     } else {
-      ok("gpu", "throttle state", "no hardware throttle");
+      ok("gpu", "throttle state", "no throttle");
     }
   }
 }
@@ -138,8 +139,11 @@ async function checkOllama() {
   // Server env — prefer host-injected (Docker-sibling flow), fall back to
   // local docker inspect, finally the process environment.
   let env = null;
+  // Honour OLLAMA_BENCH_OLLAMA_CONTAINER so deployments that rename the
+  // Ollama container (matches the wrapper's behaviour) still find env state.
+  const ollamaContainer = process.env.OLLAMA_BENCH_OLLAMA_CONTAINER || "ollama";
   const envJson = process.env.OLLAMA_BENCH_SERVER_ENV_JSON
-    || tryExec("docker inspect ollama --format '{{json .Config.Env}}' 2>/dev/null");
+    || tryExec(`docker inspect ${ollamaContainer} --format '{{json .Config.Env}}' 2>/dev/null`);
   if (envJson) {
     try {
       const arr = JSON.parse(envJson);

@@ -201,7 +201,17 @@ function timeoutMsFor(numPredict) {
   return 120_000 + numPredict * 600;
 }
 
-async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
+// Bridge an external AbortSignal (e.g. shared cancel for a concurrency batch)
+// into a local controller so we can also abort on our per-call timeout.
+function linkSignal(signal, localAc) {
+  if (!signal) return () => {};
+  if (signal.aborted) { localAc.abort(); return () => {}; }
+  const onAbort = () => localAc.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  return () => signal.removeEventListener("abort", onAbort);
+}
+
+async function generate(prompt, { numPredict = 128, keepAlive, signal } = {}) {
   // Streaming mode so we can timestamp the first token's arrival for TTFT.
   // Ollama returns NDJSON: one JSON object per line. First object with a
   // non-empty `response` field is the first decoded token; final object
@@ -217,6 +227,12 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
   if (keepAlive !== undefined) body.keep_alive = keepAlive;
   const timeoutMs = timeoutMsFor(numPredict);
   const t = withTimeout(timeoutMs);
+  // Combine the caller's signal (concurrency-batch cancel) with the timer's
+  // so the in-flight fetch aborts on either trigger.
+  const ac = new AbortController();
+  const unlinkTimer = linkSignal(t.signal, ac);
+  const unlinkOuter = linkSignal(signal, ac);
+  const cleanup = () => { unlinkTimer(); unlinkOuter(); t.cancel(); };
   const t0 = performance.now();
   let res;
   try {
@@ -224,15 +240,18 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal: t.signal,
+      signal: ac.signal,
     });
   } catch (e) {
-    t.cancel();
-    if (e.name === "AbortError") throw new Error(`Ollama /api/generate timed out after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    cleanup();
+    if (e.name === "AbortError") {
+      if (signal?.aborted) throw new Error(`Ollama /api/generate aborted by caller (numPredict=${numPredict})`);
+      throw new Error(`Ollama /api/generate timed out after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    }
     throw e;
   }
   if (!res.ok) {
-    t.cancel();
+    cleanup();
     throw new Error(`HTTP ${res.status}: ${await res.text()}`);
   }
 
@@ -263,17 +282,25 @@ async function generate(prompt, { numPredict = 128, keepAlive } = {}) {
       }
     }
   } catch (e) {
-    if (e.name === "AbortError") throw new Error(`Ollama stream aborted after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    if (e.name === "AbortError") {
+      if (signal?.aborted) throw new Error(`Ollama stream aborted by caller (numPredict=${numPredict})`);
+      throw new Error(`Ollama stream aborted after ${timeoutMs}ms (numPredict=${numPredict}) — check ${HOST} or set OLLAMA_BENCH_TIMEOUT_MS`);
+    }
     throw e;
   } finally {
-    t.cancel();
+    cleanup();
   }
   if (!final) throw new Error("Ollama stream ended without a done=true chunk");
+  // Guard the divisions: a prefix-cache hit returns eval_duration=0 alongside
+  // a non-zero eval_count, which would yield Infinity and poison the median.
+  // 0 is a better sentinel than NaN — it's countable, the cell at issue is
+  // visibly outlier, and validateBaselineShape catches negatives but not Inf.
+  const safeTps = (count, ns) => (ns > 0 ? count / (ns / 1e9) : 0);
   return {
     promptTokens:    final.prompt_eval_count ?? 0,
     genTokens:       final.eval_count ?? 0,
-    promptTps:       final.prompt_eval_count / (final.prompt_eval_duration / 1e9),
-    genTps:          final.eval_count / (final.eval_duration / 1e9),
+    promptTps:       safeTps(final.prompt_eval_count ?? 0, final.prompt_eval_duration ?? 0),
+    genTps:          safeTps(final.eval_count ?? 0,        final.eval_duration ?? 0),
     totalMs:         final.total_duration / 1e6,
     loadMs:          (final.load_duration ?? 0) / 1e6,
     evalDurationMs:  (final.eval_duration ?? 0) / 1e6,
@@ -399,7 +426,10 @@ async function probeVramFracUsed(envSnap) {
   if (r) {
     try {
       const j = await r.json();
-      const vramBytes = (j.models ?? []).reduce((a, m) => a + (m.size_vram ?? 0), 0);
+      // Coerce to Number: Ollama nominally returns size_vram as a JSON number,
+      // but a string sneaks through occasionally and `a + "1000"` would switch
+      // the reducer to string concatenation, mis-driving the VRAM cap.
+      const vramBytes = (j.models ?? []).reduce((a, m) => a + (Number(m.size_vram) || 0), 0);
       if (vramBytes > 0) return (vramBytes / (1024 * 1024)) / totalMiB;
     } catch { /* fall through */ }
   }
@@ -471,8 +501,16 @@ async function scenarioConcurrent(isSave, levels = [1, 2, 4, 8]) {
     const samples = [];
     for (let r = 0; r < samplesHere; r++) {
       const prompts = Array.from({ length: n }, (_, k) => mkPrompt(ctxIdx, r * 100 + k));
+      // Shared cancel: if any of the N streams errors out, the rest get aborted
+      // immediately. Without this, a single timeout/HTTP-error left the other
+      // streams running to completion, holding the HTTP connection open and
+      // (on heavy models) keeping the box pinned at full GPU load for the
+      // remaining ones — the exact "concurrent stage wedged the host" pattern.
+      const batch = new AbortController();
       const t0 = performance.now();
-      const outs = await Promise.all(prompts.map(p => generate(p, { numPredict })));
+      const outs = await Promise.all(prompts.map(p =>
+        generate(p, { numPredict, signal: batch.signal }).catch(e => { batch.abort(); throw e; })
+      ));
       const wall = (performance.now() - t0) / 1000;
       const totalGen = outs.reduce((a, o) => a + o.genTokens, 0);
       // e2e = end-to-end throughput including prompt-eval + network; what a
@@ -820,16 +858,19 @@ function printColdStart(cur, base) {
     { label: "value",  align: "r" },
     { label: "Δ",      align: "r" },
   ];
+  // Older baselines (and partial saves) can have null/missing coldStart cells.
+  // Optional-chain every dereference so a missing baseline shows "—" rather
+  // than crashing the whole compare run.
+  const bc = base?.coldStart;
   const rows = [
-    ["load ms",              fmtInt(cur.loadMs),            base ? fmtDelta(pctDelta(cur.loadMs,            base.coldStart.loadMs),            "lower")  : col.dim("—")],
-    ["first prompt wall ms", fmtInt(cur.firstPromptWallMs), base ? fmtDelta(pctDelta(cur.firstPromptWallMs, base.coldStart.firstPromptWallMs), "lower")  : col.dim("—")],
+    ["load ms",              fmtInt(cur.loadMs),            bc?.loadMs            != null ? fmtDelta(pctDelta(cur.loadMs,            bc.loadMs),            "lower")  : col.dim("—")],
+    ["first prompt wall ms", fmtInt(cur.firstPromptWallMs), bc?.firstPromptWallMs != null ? fmtDelta(pctDelta(cur.firstPromptWallMs, bc.firstPromptWallMs), "lower")  : col.dim("—")],
   ];
   if (cur.firstTokenMs != null) {
-    const baseTtft = base?.coldStart?.firstTokenMs;
-    const delta = baseTtft != null ? fmtDelta(pctDelta(cur.firstTokenMs, baseTtft), "lower") : col.dim("—");
+    const delta = bc?.firstTokenMs != null ? fmtDelta(pctDelta(cur.firstTokenMs, bc.firstTokenMs), "lower") : col.dim("—");
     rows.push(["ttft ms", fmtInt(cur.firstTokenMs), delta]);
   }
-  rows.push(["gen t/s", fmtFloat(cur.genTps, 1), base ? fmtDelta(pctDelta(cur.genTps, base.coldStart.genTps), "higher") : col.dim("—")]);
+  rows.push(["gen t/s", fmtFloat(cur.genTps, 1), bc?.genTps != null ? fmtDelta(pctDelta(cur.genTps, bc.genTps), "higher") : col.dim("—")]);
   console.log(renderTable(columns, rows));
 }
 

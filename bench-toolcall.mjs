@@ -149,7 +149,10 @@ function scoreCase(c, out) {
       schemaReason = `unknown tool: ${calledName}`;
     } else {
       const required = calledDef.parameters?.required ?? [];
-      const missing = required.filter(k => !(k in parsed) || parsed[k] === "");
+      // Treat null / undefined / "" as missing — a model emitting
+      // `{"to": null, ...}` shouldn't pass schema validation for a required
+      // string argument.
+      const missing = required.filter(k => !(k in parsed) || parsed[k] == null || parsed[k] === "");
       schemaOk = missing.length === 0;
       if (!schemaOk) schemaReason = `missing required keys: ${missing.join(",")}`;
     }

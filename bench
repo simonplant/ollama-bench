@@ -62,6 +62,9 @@ if [[ -z "$CONTAINER" ]] \
   CANDIDATES=()
   while IFS= read -r net; do
     [[ -z "$net" ]] && continue
+    # `host`/`none`/`bridge` would enumerate unrelated containers; only the
+    # user-defined network gives us a real "sibling on Ollama's network" set.
+    [[ "$net" == "host" || "$net" == "none" || "$net" == "bridge" ]] && continue
     while IFS= read -r name; do
       [[ -z "$name" ]] && continue
       [[ "$name" == "$OLLAMA_CONTAINER" ]] && continue
@@ -78,6 +81,8 @@ if [[ -z "$CONTAINER" ]] \
   if (( ${#CANDIDATES[@]} == 1 )); then
     CONTAINER="${CANDIDATES[0]}"
   elif (( ${#CANDIDATES[@]} > 1 )); then
+    # Sort for deterministic output across runs (docker iterates in map order).
+    mapfile -t CANDIDATES < <(printf '%s\n' "${CANDIDATES[@]}" | sort)
     echo "multiple sibling containers on ${OLLAMA_CONTAINER}'s network with node installed:" >&2
     printf '  %s\n' "${CANDIDATES[@]}" >&2
     echo "set OLLAMA_BENCH_CONTAINER=<name> to disambiguate" >&2
@@ -134,7 +139,10 @@ if (( ${#MISSING[@]} > 0 )); then
   exit 2
 fi
 for script in "${SCRIPTS[@]}"; do
-  docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_DIR/$script" < "$HERE/$script"
+  # Pass the destination path via env so the inner shell sees a quoted
+  # variable instead of an interpolated string — robust against REMOTE_DIR
+  # values that contain spaces or shell metacharacters.
+  docker exec -i -e DST="$REMOTE_DIR/$script" "$CONTAINER" sh -c 'cat > "$DST"' < "$HERE/$script"
 done
 
 # Stable machine fingerprint — read the host's machine-id and pass it in.
@@ -183,10 +191,12 @@ fi
 
 # Seed baseline from host if we have one. Capture content hash so we can
 # detect mutation after the run without being fooled by mtime bumps from
-# the copy-in itself.
+# the copy-in itself. Hash failures (md5sum missing) leave PRE_HASH empty,
+# which forces a sync-back at the end (safer to over-copy than skip a real
+# change).
 if [[ -f "$BASELINE_HOST" ]]; then
-  docker exec -i "$CONTAINER" sh -c "cat > $REMOTE_BASELINE" < "$BASELINE_HOST"
-  PRE_HASH=$(md5sum "$BASELINE_HOST" | cut -d' ' -f1)
+  docker exec -i -e DST="$REMOTE_BASELINE" "$CONTAINER" sh -c 'cat > "$DST"' < "$BASELINE_HOST"
+  PRE_HASH=$(md5sum "$BASELINE_HOST" 2>/dev/null | cut -d' ' -f1 || true)
 else
   docker exec "$CONTAINER" rm -f "$REMOTE_BASELINE"
   PRE_HASH=""
@@ -225,19 +235,33 @@ if [[ -n "$HOST_PERSISTENCED" ]]; then
   export OLLAMA_BENCH_PERSISTENCED="$HOST_PERSISTENCED"
   EXEC_ENV+=(-e OLLAMA_BENCH_PERSISTENCED)
 fi
+# Per-call request timeout — documented at the top of this file as
+# "forwarded to the harness" but previously not actually forwarded.
+if [[ -n "${OLLAMA_BENCH_TIMEOUT_MS:-}" ]]; then
+  EXEC_ENV+=(-e "OLLAMA_BENCH_TIMEOUT_MS=$OLLAMA_BENCH_TIMEOUT_MS")
+fi
 set +e
 docker exec "${EXEC_ENV[@]}" "$CONTAINER" node "$REMOTE_DIR/bench.mjs" "$@" --out "$REMOTE_BASELINE"
 EXIT=$?
 set -e
 
-# Sync baseline state back to host only if the run actually changed it
-# (content hash differs, or the file was deleted in-container).
+# Sync baseline state back to host only if the run actually changed it.
+# Empty POST_HASH (md5sum missing in container) is treated as "changed" so
+# we copy back rather than silently skip. Write goes to a temp file and is
+# renamed on success — if the wrapper is interrupted mid-copy, the existing
+# host baseline is preserved instead of being half-written.
 if [[ $EXIT -eq 0 ]]; then
   if docker exec "$CONTAINER" test -f "$REMOTE_BASELINE"; then
-    POST_HASH=$(docker exec "$CONTAINER" md5sum "$REMOTE_BASELINE" | cut -d' ' -f1)
-    if [[ "$POST_HASH" != "$PRE_HASH" ]]; then
-      docker exec "$CONTAINER" cat "$REMOTE_BASELINE" > "$BASELINE_HOST"
-      echo "host baseline: $BASELINE_HOST"
+    POST_HASH=$(docker exec "$CONTAINER" md5sum "$REMOTE_BASELINE" 2>/dev/null | cut -d' ' -f1 || true)
+    if [[ -z "$POST_HASH" || "$POST_HASH" != "$PRE_HASH" ]]; then
+      TMP="$BASELINE_HOST.tmp.$$"
+      if docker exec "$CONTAINER" cat "$REMOTE_BASELINE" > "$TMP"; then
+        mv -f "$TMP" "$BASELINE_HOST"
+        echo "host baseline: $BASELINE_HOST"
+      else
+        rm -f "$TMP"
+        echo "warning: failed to copy baseline back from container" >&2
+      fi
     fi
   elif [[ -n "$PRE_HASH" ]]; then
     rm -f "$BASELINE_HOST"
