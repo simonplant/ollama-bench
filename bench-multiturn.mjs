@@ -1,28 +1,28 @@
 #!/usr/bin/env node
 /**
- * Multi-turn tool-call probe — scores what the model does AFTER a tool returns.
- * Each case: initial user prompt → expected first tool call → fabricated tool
- * result injected → second turn scored against a pass rule.
+ * Multi-turn tool-call probe — scores the second turn after a tool returns.
+ * Each case: user prompt → expected first tool call → fabricated tool result
+ * → second-turn response scored against a pass rule.
  *
  * Pass rules:
- *   FINAL       — second turn must be a text message, no tool_calls
- *   CHAIN:<nm>  — second turn must call tool <nm> (legitimate chain)
- *   EMPTY_OK    — any response acceptable; only non-loop behavior is checked
+ *   FINAL       second turn is text only, no tool_calls
+ *   CHAIN:<nm>  second turn calls tool <nm>
+ *   EMPTY_OK    any non-loop response accepted
  *
  * Failure signatures:
- *   - same tool called again with identical args        (canonical loop)
- *   - same tool called again with different args        (arg-hallucination loop)
- *   - unrelated tool called when text was expected
- *   - empty/whitespace content where synthesis expected
+ *   same tool called again with identical args      (canonical loop)
+ *   same tool called again with different args      (arg-hallucination loop)
+ *   unrelated tool called when text was expected
+ *   empty/whitespace content where synthesis expected
  *
  * Usage:
  *   node bench-multiturn.mjs [--model gemma4:26b] [--host http://ollama:11434]
  *                            [--out ./baseline.json] [--save|--compare] [-v|--verbose]
  *
- * Default mode is smart: saves if --model has no multiturn entry in the
- * baseline, compares otherwise. Pass% deltas flag drops past ±REG_PP (5pp).
+ * Modes: smart (default — save if no entry, compare otherwise), --save, --compare.
+ * Pass% deltas flag drops past ±5pp.
  *
- * Per-call request timeout: 180s, override via OLLAMA_BENCH_TIMEOUT_MS.
+ * Per-call timeout: 180s. Override: OLLAMA_BENCH_TIMEOUT_MS.
  */
 
 import { TOOLS } from "./bench-tools.mjs";

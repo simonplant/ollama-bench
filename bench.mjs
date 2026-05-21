@@ -1,41 +1,13 @@
 #!/usr/bin/env node
 /**
  * ollama-bench — unified CLI: perf regression, tool-call probes, model league.
+ * Run `./bench --help` (or `node bench.mjs --help`) for the full surface.
  *
- * Default (no subcommand) runs the perf benchmark with smart baseline
- * behavior keyed by --model: saves a slice on first run, compares on every
- * run after.
+ * Subcommands:  perf | toolcall | multiturn | jobs | doctor | all | rank |
+ *               league | routes | baseline [show|clear [tag]]
+ * Default (no subcommand): smart perf — save on first run, compare after.
  *
- * Subcommands:
- *   perf [save|compare|run]   Throughput benchmark. No mode → smart default.
- *   toolcall                  Single-turn tool-call accuracy probe.
- *   multiturn                 Multi-turn tool-call probe (post-tool-result).
- *   jobs                      Judge-scored quality probe across job roles
- *                             (trading_brief, x_analysis, document_prep,
- *                             hard_toolcall, reasoning).
- *   doctor                    Preflight audit — GPU / Ollama / host config.
- *   all                       perf (smart) + toolcall + multiturn + jobs for --model.
- *   rank                      Bench --model end-to-end and (re)write its slice in the league.
- *   league                    Ranked table across all models benched on this machine.
- *   routes                    Best-in-breed model per job, with quality-per-second view.
- *   baseline [show|clear|clear <model>]
- *                             Inspect, nuke, or drop one model entry.
- *   help                      Print usage.
- *
- * Flags:
- *   --model <tag>             default gemma4:26b
- *   --host <url>              default http://ollama:11434
- *   --runs <n>                per-cell runs, default 3 (perf only)
- *   --out <path>              baseline file, default ./baseline.json
- *   --regression-pct <n>      flag threshold, default 5 (perf only)
- *   --concurrent-levels <csv> override the parallel=N levels for stage 3
- *                             (e.g. 1,2,4). Default is auto-resolved from
- *                             NUM_PARALLEL + model params + VRAM headroom.
- *   --no-concurrent           skip stage 3 entirely (or OLLAMA_BENCH_NO_CONCURRENT=1).
- *   -v, --verbose             per-case output (toolcall/multiturn)
- *
- * Baseline is per-machine, keyed by model (schema v2). Older flat-shaped
- * baselines auto-migrate on read.
+ * Baseline: ./baseline.json, schema v2 (per-machine, per-model).
  */
 
 import { existsSync, unlinkSync } from "node:fs";
@@ -1469,8 +1441,8 @@ EXAMPLES
   ./bench baseline show                # what's in the baseline, per model
   ./bench baseline clear nemotron3     # drop one model from the league
 
-Back-compat: 'save'/'compare'/'run' at top level still route to 'perf'.
-Schema: baseline.json is keyed by model (v2). v1 baselines auto-migrate on read.`);
+Top-level 'save' / 'compare' / 'run' are aliases for 'perf <mode>'.
+Baseline schema: v2 (per-machine, per-model). v1 files auto-migrate on read.`);
 }
 
 // ── Main dispatcher ──────────────────────────────────────────────────────────

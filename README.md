@@ -1,149 +1,153 @@
 # ollama-bench
 
-A measurement harness for local [Ollama](https://ollama.com) on a single machine. Three things in one tool:
+Measurement harness for local [Ollama](https://ollama.com). Three subsystems:
 
-1. **Throughput regression check.** Same model, same box, same workload — did your last config change make it slower?
-2. **Per-machine model league.** Bench multiple models on the same hardware and rank them by what matters: gen t/s, TTFT, cold-load, concurrency, tool-use accuracy.
-3. **Tool-calling capability probes.** Single-turn (does the model pick the right tool?) and multi-turn (does it loop after a tool returns?).
+1. **Throughput regression check** against a per-machine baseline.
+2. **Per-machine model league** ranking models on the same hardware.
+3. **Tool-calling capability probes** — single-turn and multi-turn.
 
-Assumes a Docker-native setup: Ollama runs inside a container on a user-defined bridge network, reachable only from sibling containers. The `./bench` wrapper pipes the harness into a sibling, runs it there, and syncs results back to the host. For native-host Ollama, see [Direct host invocation](#direct-host-invocation).
+Run mode: a `./bench` bash wrapper that copies the harness into a sibling Docker container with network access to Ollama and runs it there, syncing the baseline back to the host on exit. Native-host Ollama is supported via [direct invocation](#direct-host-invocation).
 
 ## Quickstart
 
 ```bash
-./bench                       # smart perf run for default model (save first time, compare after)
-./bench rank --model X        # bench X end-to-end and add it to the league
-./bench league                # ranked table across every model on this machine
-./bench doctor                # preflight audit of GPU/Ollama/host config
-./bench all                   # perf + toolcall + multiturn for current --model
+./bench                       # smart perf run for default model
+./bench rank --model X        # add or refresh model X in the league
+./bench league                # ranked table across all benched models
+./bench routes                # best model per job role
+./bench doctor                # preflight system audit
+./bench all                   # perf + toolcall + multiturn + jobs for --model
 ./bench --help                # full CLI
 ```
 
 ## CLI
 
 ```
-./bench                       Smart perf run for --model (save if no entry, compare otherwise).
-./bench perf [save|compare|run]   Explicit perf mode. Default smart.
-./bench toolcall              Single-turn tool-call accuracy probe (22 cases).
-./bench multiturn             Multi-turn probe — what happens after a tool returns (14 cases).
-./bench doctor                Audit: GPU persistence/power/throttle, Ollama env, host governor/swap.
-./bench all                   perf (smart) + toolcall + multiturn for --model.
-./bench rank                  Bench --model end-to-end and (re)write its slice in the league.
-./bench league                Ranked table across all models benched on this machine.
-./bench baseline show         Per-model summary of what's in the baseline.
+./bench                       Smart perf run: save if no baseline entry, compare otherwise.
+./bench perf [save|compare|run]   Explicit perf mode (default smart).
+./bench toolcall              Single-turn tool-call probe (22 cases).
+./bench multiturn             Multi-turn tool-call probe (14 cases).
+./bench jobs                  Judge-scored quality probe across job roles.
+./bench doctor                System audit (GPU / Ollama / host).
+./bench all                   perf + toolcall + multiturn + jobs.
+./bench rank                  Bench --model end-to-end, write its league slice.
+./bench league                Ranked table across all models.
+./bench routes                Best model per job, plus quality-per-second.
+./bench baseline show         Per-model summary of the baseline.
 ./bench baseline clear        Delete baseline.json.
 ./bench baseline clear <tag>  Drop one model's entry.
-./bench --help                Usage.
 ```
 
-Flags (any order, any subcommand):
+Flags:
 
-- `--model <tag>` — default `gemma4:26b`
-- `--host <url>` — default `http://ollama:11434`
-- `--runs <n>` — per-cell runs for perf, default 3
-- `--out <path>` — baseline file, default `./baseline.json`
-- `--regression-pct <n>` — regression threshold in %, default 5
-- `--concurrent-levels <csv>` — override the parallel=N levels in stage 3 (e.g. `--concurrent-levels 1,2,4`). Default is auto-resolved (see below).
-- `--no-concurrent` — skip stage 3 entirely. Equivalent to `OLLAMA_BENCH_NO_CONCURRENT=1`.
-- `-v` / `--verbose` — per-case output for toolcall / multiturn
-- `OLLAMA_BENCH_TIMEOUT_MS` — env override for per-call request timeout
+| Flag | Default | Effect |
+|---|---|---|
+| `--model <tag>` | `gemma4:26b` | Target model. |
+| `--host <url>` | `http://ollama:11434` | Ollama endpoint. |
+| `--runs <n>` | `3` | Per-cell runs (perf). |
+| `--out <path>` | `./baseline.json` | Baseline file. |
+| `--regression-pct <n>` | `5` | Regression threshold (%). |
+| `--concurrent-levels <csv>` | auto | Override stage-3 parallel levels. |
+| `--no-concurrent` | off | Skip stage 3. Same as `OLLAMA_BENCH_NO_CONCURRENT=1`. |
+| `--judge <tag>` | `gemma4:31b` | Judge model for `jobs`. Auto-swaps to `gpt-oss:20b` when target == judge. Must already be pulled. |
+| `-v` / `--verbose` | off | Per-case output for toolcall / multiturn / jobs. |
 
-## What the perf run measures
+Env overrides:
 
-Four dimensions, each chosen because it isolates a class of regression:
+| Var | Effect |
+|---|---|
+| `OLLAMA_BENCH_TIMEOUT_MS` | Per-call request timeout. |
+| `OLLAMA_BENCH_NO_CONCURRENT` | Skip stage 3 (equivalent to `--no-concurrent`). |
+| `OLLAMA_BENCH_THINK` | `1` to enable reasoning-mode (off by default). |
+| `OLLAMA_BENCH_JUDGE` | Default judge tag for the `jobs` probe. |
 
-1. **Single-stream generation** at three prompt sizes (short / medium / long ≈ 200 / 2K / 8K tokens) plus a long-gen cell (short prompt, 1024 output tokens). Median over N runs. Reports prompt t/s, gen t/s, TTFT (time to first decoded token), and total wall ms. Every call starts with a per-process nonce so the prompt prefix differs from any other call — defeats llama.cpp's prefix cache so prompt-eval reflects real compute.
-2. **Cold start.** Forces eviction with `keep_alive: "0s"`, then measures load duration, full-reply wall time, and TTFT for the next request. Median over 3 cycles.
-3. **Concurrency.** Up to 1 / 2 / 4 / 8 parallel streams at a medium prompt × 64-token gen. Three per-row metrics: `e2e t/s` (end-to-end wall throughput, what a caller experiences), `decode t/s` (aggregate pure-decoder, isolates batcher scaling from prompt-eval), `per-stream t/s` (median per-request). Levels are **auto-capped** to keep heavy/MoE models from blowing past VRAM: serialized servers (`OLLAMA_NUM_PARALLEL=1`) skip the stage entirely, large models drop high-N levels (≥30B → max n=4, ≥45B → n=2, ≥65B → skipped), and ≥85% post-warmup VRAM occupancy tightens the cap further. Pass `--concurrent-levels` to override or `--no-concurrent` to skip.
-4. **Environment snapshot.** Ollama version, model digest + quant, GPU state (name, driver, VRAM, util, temp, power, SM clock), and the Ollama server's `OLLAMA_*` env vars. Stored alongside the numbers so a regression run diffs *what changed* alongside *how it changed*.
+## Perf measurements
 
-Compare mode flags any cell more than 5% worse than baseline with ⚠. Baselines include per-cell noise floors (2σ); the effective threshold is `max(--regression-pct, 2× cv%)`. An `[environment changes vs baseline]` block lists scalar deltas (Ollama version, GPU driver, `OLLAMA_NUM_PARALLEL`, etc.).
+1. **Single-stream**: short / medium / long prompts (~200 / 2K / 8K tokens) plus a long-gen cell (short prompt, 1024 output tokens). Median over `--runs`. Reports prompt t/s, gen t/s, TTFT, total wall ms. Each call starts with a per-process nonce so llama.cpp's prefix cache can't hide prompt-eval.
+2. **Cold start**: forces eviction with `keep_alive: "0s"`, then measures load duration, full-reply wall, and TTFT on the next request. Median over 3 cycles.
+3. **Concurrency**: 1 / 2 / 4 / 8 parallel streams at medium prompt × 64-token gen. Reports `e2e t/s`, `decode t/s`, `per-stream t/s`. Levels auto-cap by `OLLAMA_NUM_PARALLEL`, model params (≥30B → max n=4, ≥45B → n=2, ≥65B → skip), and post-warmup VRAM (≥75% / ≥85% / ≥95% tighten further). `OLLAMA_NUM_PARALLEL=1` skips the stage. `--concurrent-levels` overrides; `--no-concurrent` skips.
+4. **Environment snapshot**: Ollama version, model digest + quant, GPU state (name, driver, VRAM, util, temp, power, SM clock), Ollama server `OLLAMA_*` env.
 
-A full perf run takes ~2 minutes for a 26B model on a single modern GPU.
+`compare` mode flags cells worse than `max(--regression-pct, 2 × cv%)` with ⚠. Environment-change deltas (Ollama version, GPU driver, `OLLAMA_NUM_PARALLEL`, etc.) print in a separate block.
 
 ## Model league
 
-`baseline.json` is keyed by model: one machine, many models. `./bench rank --model <tag>` benches a model end-to-end and writes its slice. `./bench league` prints the ranked table:
+`baseline.json` is keyed by model. `./bench rank --model <tag>` benches end-to-end and writes the slice. `./bench league` prints:
 
-| column | source |
+| Column | Source |
 |---|---|
 | `model` | tag |
-| `params` / `quant` | from `/api/show` |
+| `params` / `quant` | `/api/show` |
 | `gen t/s` | short-prompt single-stream median |
 | `ttft ms` | short-prompt time to first token |
-| `cold load` | median load duration after forced eviction |
+| `cold load` | median load after forced eviction |
 | `n=4 t/s` | per-stream throughput at parallel=4 |
 | `tool %` / `multi %` | toolcall + multiturn pass rate |
-| `age` | days since this entry was last refreshed; ⚠ at >30d |
+| `jobs` | overall quality score |
+| `age` | days since last refresh (⚠ at >30d) |
 
-Sorted by `gen t/s` descending. Entries refresh independently — re-running `rank` for one model doesn't touch the others.
+Sorted by `gen t/s` descending. `./bench routes` regroups the same data by job role with a quality-per-second view.
 
 ## Tool-calling probes
 
-Separate from throughput. These score capability, not speed.
-
 ### `toolcall` — single-turn (22 cases)
 
-Three categories:
-- `simple` — one obvious tool should be called
-- `multiple` — disambiguate across tools (some cases accept alternates)
-- `relevance` — no tool should be called
+Categories: `simple` (one obvious tool), `multiple` (disambiguate; alternates accepted via `altNames`), `relevance` (no tool should be called). Reports pass% and schema% per category. `schema%` scores arguments against the tool the model actually called.
 
-Reports pass% and schema% per category. `schema%` scores arguments against whichever tool the model actually called — a wrong-tool pick with well-formed args still counts as valid schema fidelity. Compare deltas flag drops past `±5pp` to filter run-to-run noise.
+### `multiturn` — two-turn (14 cases)
 
-### `multiturn` — two-turn with fabricated tool results (14 cases)
+Initial prompt → expected first tool call → fabricated tool result injected → second turn scored. Categories:
 
-Initial prompt triggers a tool call; the probe injects a fabricated tool result; the model's next turn is scored. Four categories:
-
-- **Synthesis** — tool returned useful data; model should summarize.
-- **Empty** — tool returned `[]`; model should say "no results", not re-call.
+- **Synthesis** — tool returned data; model should summarize.
+- **Empty** — tool returned `[]`; model should say "no results".
 - **Error** — tool returned `{error: ...}`; model should surface or handle.
-- **Chain** — tool 1 succeeded; model should legitimately call tool 2.
+- **Chain** — tool 1 succeeded; model should call tool 2.
 
-Failure signatures are specific: `LOOP: re-called X with identical args`, `LOOP: re-called X with different args`, `unexpected tool call: Y`, `expected synthesis, got 0-char content`.
+Failure signatures: `LOOP: re-called X with identical args`, `LOOP: re-called X with different args`, `unexpected tool call: Y`, `expected synthesis, got 0-char content`.
 
-Both probes share `bench-tools.mjs` (LifeOps-shaped: email, calendar, tasks, quote, web search) and use a 180s per-call timeout (`OLLAMA_BENCH_TIMEOUT_MS` to override).
+Both probes share `bench-tools.mjs` (email, calendar, tasks, quote, web search). Per-call timeout: 180s (`OLLAMA_BENCH_TIMEOUT_MS` overrides).
+
+## Jobs probe
+
+`./bench jobs` (or `./bench rank ...` which includes it) runs a judge-scored quality probe across job roles: `trading_brief`, `x_analysis`, `document_prep`, `hard_toolcall`, `reasoning`. Hybrid scoring per case:
+
+- `deterministic`: JSON parse, required keys, gold-label match, numeric tolerance
+- `judge`: a separate model rates the response on a 0–3 rubric
+- `caseScore = 0.5 × deterministic + 0.5 × (judge / 3)`, in `[0, 1]`
+
+Two-pass under `OLLAMA_MAX_LOADED_MODELS=1`: pass 1 generates all responses with the candidate; pass 2 loads the judge once and scores. Per-call timeout: 240s.
 
 ## Doctor
 
-`./bench doctor` audits the system before you bench it. Each check emits ✓ ok / ⚠ warn / ✗ fail / · info / ? unknown, with a fix command when actionable:
+`./bench doctor` emits ✓ ok / ⚠ warn / ✗ fail / · info / ? unknown per check, with a fix command when actionable.
 
-- **GPU**: persistence mode, power-limit headroom, hardware throttle bits.
-- **Ollama**: API reachable (10s timeout), server version, `OLLAMA_NUM_PARALLEL`, KV cache + flash attention combo (catches the silent f16 fallback when `KV_CACHE_TYPE=q4_0` without `FLASH_ATTENTION=1`), `KEEP_ALIVE`, `CONTEXT_LENGTH`, model presence.
+- **GPU**: persistence mode, power-limit headroom, hardware/SW throttle bits.
+- **Ollama**: API reachable (10s timeout), server version, `OLLAMA_NUM_PARALLEL`, KV cache + flash attention combo, `KEEP_ALIVE`, `CONTEXT_LENGTH`, model presence.
 - **Host**: CPU governor, swap usage.
 
-Exits non-zero only on real failures; warns are advisory.
+Exits non-zero only on `fail`.
 
 ## Container setup
 
-Wrapper environment variables:
+Wrapper env vars:
 
-- `OLLAMA_BENCH_CONTAINER` — sibling container name (Node 20+, network access to Ollama). Auto-tries `openclaw` then `engine-openclaw-1`.
-- `OLLAMA_BENCH_OLLAMA_CONTAINER` — name of the Ollama container whose `OLLAMA_*` env the wrapper reads via `docker inspect`. Default `ollama`.
-- `OLLAMA_BENCH_REMOTE_DIR` — writable path inside the sibling. Default `/tmp`.
-- `OLLAMA_BENCH_MACHINE_ID` — stable machine fingerprint seed. Auto-populated from `/etc/machine-id` (or `/var/lib/dbus/machine-id`).
-- `OLLAMA_BENCH_TIMEOUT_MS` — per-call request timeout override.
+| Var | Default | Purpose |
+|---|---|---|
+| `OLLAMA_BENCH_CONTAINER` | auto-detect | Sibling container name (Node 20+, on Ollama's network). |
+| `OLLAMA_BENCH_OLLAMA_CONTAINER` | `ollama` | Ollama container name — `docker inspect`ed for `OLLAMA_*` env. |
+| `OLLAMA_BENCH_REMOTE_DIR` | `/tmp` | Writable path in the sibling for scripts + baseline. |
+| `OLLAMA_BENCH_MACHINE_ID` | `/etc/machine-id` | Machine fingerprint seed. |
+| `OLLAMA_BENCH_TIMEOUT_MS` | — | Per-call request timeout override. |
 
-The wrapper runs `nvidia-smi` and `docker inspect <ollama>` on the host and forwards results into the sibling as `OLLAMA_BENCH_GPU_CSV` / `OLLAMA_BENCH_GPU_EXT_CSV` / `OLLAMA_BENCH_SERVER_ENV_JSON` / `OLLAMA_BENCH_CPU_GOVERNOR` / `OLLAMA_BENCH_SWAP`. The harness prefers injected data over its own probes, so GPU state, host config, and `OLLAMA_NUM_PARALLEL` always land in the baseline even when the sibling can't see them.
+Auto-detect: lists running containers on the Ollama container's user-defined network(s), excludes the Ollama container itself, picks the unique survivor that has `node` on PATH. Bails out if zero or multiple match.
 
-All harness files (`bench.mjs`, `bench-toolcall.mjs`, `bench-multiturn.mjs`, `bench-tools.mjs`, `bench-doctor.mjs`, `bench-baseline.mjs`) are copied into the sibling under `$OLLAMA_BENCH_REMOTE_DIR`. The wrapper fails fast with a named file list if any are missing on the host. Baseline syncs back to `./baseline.json` only when content changed during the run.
+The wrapper runs `nvidia-smi` and `docker inspect <ollama>` on the host and forwards results via `OLLAMA_BENCH_GPU_CSV` / `OLLAMA_BENCH_GPU_EXT_CSV` / `OLLAMA_BENCH_SERVER_ENV_JSON` / `OLLAMA_BENCH_CPU_GOVERNOR` / `OLLAMA_BENCH_SWAP` / `OLLAMA_BENCH_PERSISTENCED`. The harness uses injected data when present, falls back to local probes otherwise.
 
-## Interpretation notes
-
-- **Per-stream t/s** stays roughly constant as concurrency rises when `OLLAMA_NUM_PARALLEL=1` — requests are serialized on a single GPU. `decode t/s` grows sub-linearly. Raise `OLLAMA_NUM_PARALLEL` for batching. The env snapshot captures which regime you measured.
-- **Noise floor** on a warm, idle machine is typically ±3–4% for throughput, ±1.5% for wall time. Baselines measure per-cell noise directly and widen the threshold to `max(--regression-pct, 2× cv%)`.
-- **GPU must be idle.** Other processes on the GPU make the numbers garbage. Doctor warns at ≥10% utilization before a run.
-- **Baselines are machine-specific.** The tool fingerprints the machine (host `/etc/machine-id` when available, GPU + hostname + kernel otherwise). Compare against a different machine prints a warning and skips the diff.
-- **Absolute numbers vary** with cooling, clock boost, background noise. Deltas against the same machine are the signal.
-
-## What it doesn't measure
-
-- **Agentic workload throughput.** Perf uses `/api/generate` with fixed prompts. Tool-call paths (`/v1/chat/completions` with tools) have different overhead — the probes exercise that path but score correctness, not speed.
-- **Very long context.** Measured up to ~8K prompt tokens. For 32K/64K/128K, edit `CTX_SIZES` in `bench.mjs`.
+All harness files (`bench.mjs`, `bench-toolcall.mjs`, `bench-multiturn.mjs`, `bench-jobs.mjs`, `bench-tools.mjs`, `bench-doctor.mjs`, `bench-baseline.mjs`) are copied into the sibling under `$OLLAMA_BENCH_REMOTE_DIR` per run. Baseline syncs back to `./baseline.json` only when content changed (atomic: temp file + rename).
 
 ## Direct host invocation
 
-If Ollama is reachable from the host directly (native install, or a container with a published port), skip the wrapper:
+When Ollama is reachable from the host directly:
 
 ```bash
 node bench.mjs --host http://localhost:11434
@@ -151,25 +155,32 @@ node bench.mjs rank --model nemotron3:33b --host http://localhost:11434
 node bench.mjs toolcall --model nemotron3:33b -v --host http://localhost:11434
 ```
 
-Every subcommand and flag works the same. Without the wrapper you lose the host-injected env (GPU CSV, server env, CPU governor) — the harness falls back to its own probes, which work on a bare-metal host.
+All subcommands and flags work identically. Without the wrapper the harness uses its own GPU / server-env probes.
 
 ## Requirements
 
 - Node 20+ (built-in `fetch`). No `npm install`.
-- An Ollama endpoint reachable from where the CLI runs.
-- Optional: `nvidia-smi` for GPU state capture.
-- Optional: `docker` CLI for `OLLAMA_*` env inspection.
+- An Ollama endpoint reachable from the runner.
+- Optional: `nvidia-smi` (GPU state), `docker` CLI (`OLLAMA_*` env inspection).
+
+## Not measured
+
+- Agentic workload throughput. Perf uses `/api/generate`; the tool-call paths score correctness, not speed.
+- Contexts above ~8K prompt tokens. Edit `CTX_SIZES` in `bench.mjs` to extend.
 
 ## Files
 
-- `bench` — host-side wrapper for the Docker-sibling flow.
-- `bench.mjs` — unified CLI entry point (perf + subcommand dispatch + league).
-- `bench-toolcall.mjs` — single-turn tool-call probe.
-- `bench-multiturn.mjs` — multi-turn tool-call probe.
-- `bench-tools.mjs` — shared tool catalogue.
-- `bench-doctor.mjs` — preflight system audit.
-- `bench-baseline.mjs` — per-model baseline I/O.
-- `baseline.json` — one per machine, keyed by model. Gitignored.
+| File | Role |
+|---|---|
+| `bench` | Host wrapper (Docker-sibling flow). |
+| `bench.mjs` | CLI entry point + perf scenarios + league/routes/baseline commands. |
+| `bench-toolcall.mjs` | Single-turn tool-call probe. |
+| `bench-multiturn.mjs` | Multi-turn tool-call probe. |
+| `bench-jobs.mjs` | Judge-scored quality probe. |
+| `bench-tools.mjs` | Shared tool catalogue. |
+| `bench-doctor.mjs` | System audit. |
+| `bench-baseline.mjs` | Per-model baseline I/O. |
+| `baseline.json` | One per machine, keyed by model. Gitignored. |
 
 ## License
 

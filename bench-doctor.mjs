@@ -2,19 +2,13 @@
 /**
  * `./bench doctor` — system audit for GPU, Ollama server, and host config.
  *
- * Each check emits one status with a fix command when actionable:
- *   ✓ ok       configured well
- *   ⚠ warn     suboptimal, advisory
- *   ✗ fail     broken or silently degraded; non-zero exit
- *   · info     neutral
- *   ? unknown  couldn't probe (e.g. sysfs unreadable from inside container)
+ * Status codes (with fix command when actionable):
+ *   ✓ ok / ⚠ warn / ✗ fail / · info / ? unknown
+ * Exits non-zero only on `fail`. Read-only — never mutates state.
  *
- * Read-only — never mutates GPU, Ollama, or host state.
- *
- * Host-side probes (CPU governor, extended nvidia-smi fields, swap) read
- * env vars injected by the ./bench wrapper when running Docker-sibling,
- * since the sibling can't see host sysfs or have nvidia-smi on PATH.
- * Falls back to local commands for direct-on-host invocation.
+ * Reads host-side data (CPU governor, extended nvidia-smi fields, swap,
+ * nvidia-persistenced) from env vars injected by the `./bench` wrapper, or
+ * directly from local commands when invoked on a bare-metal host.
  */
 
 import { execSync } from "node:child_process";

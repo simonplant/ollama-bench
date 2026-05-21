@@ -1,30 +1,27 @@
 #!/usr/bin/env node
 /**
- * Job-shaped quality probe. Scores a model on the actual task roles a router
- * needs to differentiate: structured synthesis, adversarial short-form,
- * long-form distillation, ambiguous tool-use, and multi-step reasoning.
+ * Job-shaped quality probe. Job roles: trading_brief, x_analysis,
+ * document_prep, hard_toolcall, reasoning.
  *
- * Hybrid scoring per case:
- *   - deterministic: JSON parse, required keys, gold-label match, numeric tolerance
- *   - judge:         a separate model rates the response on a 0–3 rubric
- *   - caseScore = 0.5 * deterministic + 0.5 * (judge / 3), all in [0,1]
+ * Per-case scoring:
+ *   deterministic: JSON parse, required keys, gold-label match, numeric tolerance
+ *   judge:         separate model rates the response on a 0–3 rubric
+ *   caseScore  = 0.5 * deterministic + 0.5 * (judge / 3), in [0, 1]
  *
- * Judge model defaults to gemma4:31b. Auto-swaps to gpt-oss:20b when the
- * candidate IS the default judge (so the model isn't asked to grade itself).
- * Override with --judge or OLLAMA_BENCH_JUDGE. The judge tag must already
- * appear in `ollama list` — the probe refuses to let Ollama auto-pull a
- * missing judge, which on this box has triggered host-killer model loads.
+ * Judge: defaults to gemma4:31b (fallback gpt-oss:20b when target == judge).
+ * Override with --judge or OLLAMA_BENCH_JUDGE. Judge tag must already be
+ * pulled — probe refuses to let Ollama auto-pull.
  *
- * Two-pass execution (under OLLAMA_MAX_LOADED_MODELS=1):
- *   pass 1 — candidate generates responses for all cases (one warm load)
- *   pass 2 — judge loads once, scores all cached responses
+ * Two passes under OLLAMA_MAX_LOADED_MODELS=1:
+ *   1. candidate generates responses for all cases
+ *   2. judge loads once, scores all cached responses
  *
  * Usage:
  *   node bench-jobs.mjs [--model gemma4:26b] [--host http://ollama:11434]
  *                       [--judge gemma4:31b] [--out ./baseline.json]
  *                       [--save|--compare] [-v|--verbose]
  *
- * Per-call request timeout: 240s, override via OLLAMA_BENCH_TIMEOUT_MS.
+ * Per-call timeout: 240s. Override: OLLAMA_BENCH_TIMEOUT_MS.
  */
 
 import { TOOLS } from "./bench-tools.mjs";

@@ -1,8 +1,7 @@
-// Shared baseline file I/O. Schema v2: per-model storage so one machine can
-// hold a "league table" of every model that's been benched on it. Reads
-// migrate v1 (flat) baselines on the fly so nothing breaks.
+// Shared baseline file I/O. Per-machine, per-model storage. All writes go
+// through tmp + rename. v1 baselines auto-migrate on read.
 //
-// v2 shape:
+// Schema v2:
 //   {
 //     schemaVersion: 2,
 //     machine: { machineId, hostMachineId, hostname, kernel, gpu },
@@ -11,12 +10,11 @@
 //         savedAt: ISO,
 //         perf:      { env, singleStream, coldStart, concurrent },
 //         toolcall:  { ...probe results... },
-//         multiturn: { ...probe results... }
+//         multiturn: { ...probe results... },
+//         jobs:      { ...probe results... },
 //       }
 //     }
 //   }
-//
-// Atomicity preserved: every mutation goes through tmp+rename.
 
 import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from "node:fs";
 

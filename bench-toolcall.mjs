@@ -1,30 +1,24 @@
 #!/usr/bin/env node
 /**
  * Single-turn tool-call accuracy probe via Ollama's OpenAI-compatible endpoint.
- * Uses the LifeOps tool catalogue (email, calendar, tasks, quote, web search)
- * shared with bench-multiturn.mjs.
+ * Tool catalogue shared with bench-multiturn.mjs (bench-tools.mjs).
  *
  * Usage:
  *   node bench-toolcall.mjs [--model gemma4:26b] [--host http://ollama:11434]
  *                           [--out ./baseline.json] [--save|--compare] [-v|--verbose]
  *
- * Default mode is smart: saves if --model has no toolcall entry in the
- * baseline, compares otherwise. --save forces overwrite; --compare errors
- * if the entry is missing.
+ * Modes: smart (default — save if no entry, compare otherwise), --save, --compare.
  *
- * Scoring per case:
- *   - tool_call_expected + got_call + accepted_name + args_superset(expected) → PASS
+ * Pass rules per case:
+ *   tool_call_expected + got_call + accepted_name + args_superset(expected)  → PASS
  *     (accepted_name = expect.name OR any expect.altNames)
- *   - tool_call_expected=false + no_call_produced                              → PASS
- *   - otherwise FAIL
+ *   tool_call_expected=false + no_call_produced                              → PASS
+ *   otherwise                                                                → FAIL
  *
- * schema% scores arguments against whichever tool the model actually called,
- * independently of pick correctness — a wrong-tool pick with well-formed
- * args still registers valid schema fidelity. Only malformed JSON or missing
- * required keys fail schema. Pass% deltas flag drops past ±REG_PP (5pp) to
- * filter run-to-run noise.
+ * schema% scores arguments against whichever tool the model actually called.
+ * Pass% / schema% deltas flag drops past ±5pp.
  *
- * Per-call request timeout: 180s, override via OLLAMA_BENCH_TIMEOUT_MS.
+ * Per-call timeout: 180s. Override: OLLAMA_BENCH_TIMEOUT_MS.
  */
 
 import { TOOLS } from "./bench-tools.mjs";
