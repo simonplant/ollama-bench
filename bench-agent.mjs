@@ -29,13 +29,14 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
-import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
+import { getModelSection, writeModelSection, normalizeTag } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
 import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams, samplingFor } from "./bench-thinking.mjs";
 
 const args = process.argv.slice(2);
 const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
-const MODEL    = arg("--model", "gemma4:26b");
+const MODEL    = normalizeTag(arg("--model", "gemma4:26b"));
 const HOST     = arg("--host",  "http://ollama:11434");
 const OUT      = arg("--out",   "./baseline.json");
 const CAT      = arg("--cat",   "all");
@@ -47,6 +48,12 @@ const MODE     = args.includes("--save")    ? "save"
 
 const REG_PP = 5;
 const MAX_TURNS = 8;
+
+// Reasoning level for the OpenAI-compat endpoint, resolved once per run.
+// "high" maxes reasoning on thinking models, "none" forces off, null omits
+// the field. See bench-toolcall.mjs for the full rationale.
+let REASONING = null;
+let SAMPLING = { temperature: 0 };
 
 function chatTimeoutMs() {
   const override = parseInt(process.env.OLLAMA_BENCH_TIMEOUT_MS ?? "", 10);
@@ -540,7 +547,8 @@ async function chat(messages) {
         model: MODEL,
         messages,
         tools: TOOLS,
-        temperature: 0,
+        ...SAMPLING,
+        ...(REASONING ? { reasoning_effort: REASONING } : {}),
       }),
       signal: t.signal,
     });
@@ -605,6 +613,10 @@ async function runCases() {
   }
   const byCat = new Map();
   const failedCases = [];
+  const { think, supports } = await thinkingParams(HOST, MODEL, 0, 0);
+  REASONING = supports ? (think ? "high" : "none") : null;
+  SAMPLING = samplingFor(think);
+  if (supports) console.log(`(thinking model: reasoning_effort=${REASONING})\n`);
   const gpuHandle = startSampler();
   const sysHandle = startSysSampler();
   const t0 = performance.now();

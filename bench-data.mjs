@@ -23,7 +23,7 @@ import { DatabaseSync } from "node:sqlite";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
 import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
-import { thinkingParams } from "./bench-thinking.mjs";
+import { thinkingParams, samplingFor, stripThinking } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -70,7 +70,7 @@ async function generate(prompt, system = null, think = false, numPredict = 512) 
         prompt,
         stream: false,
         think,
-        options: { temperature: 0, num_predict: numPredict },
+        options: { ...samplingFor(think), num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -82,7 +82,7 @@ async function generate(prompt, system = null, think = false, numPredict = 512) 
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const j = await res.json();
-  return j.response ?? "";
+  return stripThinking(j.response ?? "");
 }
 
 // ── table_qa ─────────────────────────────────────────────────────────────────
@@ -286,7 +286,7 @@ async function runAll() {
   const out = { savedAt: new Date().toISOString(), model: MODEL };
   const gpuHandle = startSampler();
   const sysHandle = startSysSampler();
-  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 512, 8192);
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 512, 16384);
   if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
   if (CELL === "all" || CELL === "table_qa") out.table_qa = await runTableQa(think, numPredict);
   if (CELL === "all" || CELL === "sql_gen")  out.sql_gen  = await runSqlGen(think, numPredict);

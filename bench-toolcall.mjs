@@ -25,12 +25,23 @@ import { TOOLS } from "./bench-tools.mjs";
 import { getModelSection, writeModelSection, normalizeTag } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
 import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
+import { thinkingParams, samplingFor } from "./bench-thinking.mjs";
 
 const args = process.argv.slice(2);
 // lastIndexOf so a later forwarded flag (e.g. from the ./bench wrapper) wins.
 const arg = (n, fb) => { const i = args.lastIndexOf(n); return i >= 0 ? args[i + 1] : fb; };
 const MODEL   = normalizeTag(arg("--model", "gemma4:26b"));
 const HOST    = arg("--host",  "http://ollama:11434");
+
+// Reasoning level for the OpenAI-compat endpoint, resolved once per run from
+// the model's thinking capability + OLLAMA_BENCH_THINK override. "high" maxes
+// out reasoning on thinking models; "none" forces it off; null omits the field
+// (non-thinking models — sending it can 400). Ollama auto-enables thinking when
+// the field is absent, so this only makes the level explicit/maximal.
+let REASONING = null;
+// Sampling profile, also resolved per run (greedy off-thinking, recommended
+// reasoning profile on-thinking). See bench-thinking.mjs::samplingFor.
+let SAMPLING = { temperature: 0 };
 const OUT     = arg("--out",   "./baseline.json");
 const VERBOSE = args.includes("-v") || args.includes("--verbose");
 const MODE    = args.includes("--save")    ? "save"
@@ -100,7 +111,8 @@ async function runOne(c) {
         model: MODEL,
         messages: [{ role: "user", content: c.prompt }],
         tools: TOOLS,
-        temperature: 0,
+        ...SAMPLING,
+        ...(REASONING ? { reasoning_effort: REASONING } : {}),
       }),
       signal: t.signal,
     });
@@ -182,6 +194,12 @@ const caseId = c => `${c.cat}::${c.prompt}`;
 async function runCases() {
   const byCat = new Map();
   const failedPrompts = [];
+  // Budgets unused here (chat endpoint bounds output by context, not
+  // num_predict); we only want the resolved think/supports decision.
+  const { think, supports } = await thinkingParams(HOST, MODEL, 0, 0);
+  REASONING = supports ? (think ? "high" : "none") : null;
+  SAMPLING = samplingFor(think);
+  if (supports) console.log(`(thinking model: reasoning_effort=${REASONING})\n`);
   const gpuHandle = startSampler();
   const sysHandle = startSysSampler();
   const t0 = performance.now();

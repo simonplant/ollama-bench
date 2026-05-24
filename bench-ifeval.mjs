@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { getModelSection, writeModelSection } from "./bench-baseline.mjs";
 import { startSampler, stopSampler, fmtGpuSummary } from "./bench-gpu.mjs";
 import { startSysSampler, stopSysSampler, fmtSysSummary } from "./bench-sys.mjs";
-import { thinkingParams } from "./bench-thinking.mjs";
+import { thinkingParams, samplingFor, stripThinking } from "./bench-thinking.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -256,7 +256,7 @@ async function generate(prompt, think, numPredict) {
         think,
         // 1024 tokens — IFEval prompts often ask for >300 words. Thinking
         // models need a larger budget so reasoning + answer both fit.
-        options: { temperature: 0, num_predict: numPredict },
+        options: { ...samplingFor(think), num_predict: numPredict },
       }),
       signal: t.signal,
     });
@@ -268,7 +268,7 @@ async function generate(prompt, think, numPredict) {
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const j = await res.json();
-  return j.response ?? "";
+  return stripThinking(j.response ?? "");
 }
 
 // ── Runner ───────────────────────────────────────────────────────────────────
@@ -276,7 +276,7 @@ async function runCases() {
   let cases = loadJsonl(join(ROOT, "data", "ifeval.jsonl"));
   if (LIMIT) cases = cases.slice(0, LIMIT);
 
-  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 1024, 8192);
+  const { think, numPredict, supports } = await thinkingParams(HOST, MODEL, 1024, 16384);
   if (supports) console.log(`(thinking model: think=${think}, num_predict=${numPredict})\n`);
 
   const byInstr = new Map();        // instruction id → { total, pass }

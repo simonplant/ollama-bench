@@ -20,16 +20,18 @@ import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from 
 
 export const SCHEMA_VERSION = 2;
 
-// Ollama treats model tags case-insensitively and quant variants
-// (`foo:1b-q4_K_M`) share a manifest with the bare tag (`foo:1b`). All probes
-// run user-supplied tags through this normalizer at parse time so equality
-// comparisons, baseline keys, and judge swaps all see the same shape.
+// Ollama treats model tags case-insensitively (verified: `gemma4:31B`
+// resolves the same manifest as `gemma4:31b`), so we lowercase to get a
+// canonical form for equality (judge-swap), baseline keys, and the tag the
+// harness sends to the API. We deliberately do NOT strip any suffix: quant
+// (`-it-q8_0`), context-window (`-131k`/`-262k`), and other variants are
+// distinct manifests with distinct weights/behaviour. Collapsing them would
+// silently benchmark the wrong build and force genuinely different models to
+// share one baseline row — exactly the failure mode that motivated dropping
+// the earlier quant-stripping logic.
 export function normalizeTag(t) {
   if (t == null) return t;
-  const lower = String(t).toLowerCase();
-  const colon = lower.indexOf(":");
-  if (colon < 0) return lower;
-  return `${lower.slice(0, colon)}:${lower.slice(colon + 1).split("-")[0]}`;
+  return String(t).toLowerCase();
 }
 
 // Read raw file, migrate v1 → v2 on the fly. Returns null if missing.

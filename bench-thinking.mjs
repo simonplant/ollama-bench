@@ -54,3 +54,36 @@ export async function thinkingParams(host, model, baseNumPredict, thinkingNumPre
     supports,
   };
 }
+
+// Sampling profile for a request. Thinking models degrade under greedy
+// decoding — repetition loops and degenerate output, per Qwen3 and DeepSeek-R1
+// guidance — so when thinking is on we use the widely-recommended reasoning
+// profile (temp 0.6 / top_p 0.95 / top_k 20) instead of temp 0. Non-thinking
+// runs stay greedy for deterministic grading. OLLAMA_BENCH_GREEDY=1 forces
+// greedy everywhere for fully reproducible runs (at some accuracy cost on
+// thinking models). Spread into the request `options` (native) or body (OpenAI).
+export function samplingFor(think) {
+  if (process.env.OLLAMA_BENCH_GREEDY === "1") return { temperature: 0 };
+  return think
+    ? { temperature: 0.6, top_p: 0.95, top_k: 20 }
+    : { temperature: 0 };
+}
+
+// Strip inline reasoning blocks from a model's visible output. With think /
+// reasoning_effort enabled Ollama returns reasoning in a separate field and
+// `response`/`content` is clean — but some models/templates leak
+// <think>…</think> (or <thinking>/<reasoning>) into the visible text, and a
+// model that always reasons (e.g. deepseek-r1) does so even when thinking is
+// forced off. Answer extractors run on the post-strip text so a leaked chain
+// can't poison parsing (e.g. grabbing a number or option letter from the
+// reasoning instead of the final answer). No-op when no tags are present.
+export function stripThinking(text) {
+  if (!text) return text ?? "";
+  return String(text)
+    // Closed reasoning blocks anywhere in the text.
+    .replace(/<(think|thinking|reasoning)>[\s\S]*?<\/\1>/gi, "")
+    // Dangling open block (reasoning truncated by num_predict, never closed):
+    // drop from the tag to end — there's no final answer past it anyway.
+    .replace(/<(think|thinking|reasoning)>[\s\S]*$/i, "")
+    .trim();
+}
